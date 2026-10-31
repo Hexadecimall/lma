@@ -1,0 +1,327 @@
+"""Isolated installer tests: fake build/VCS tools, temporary checkouts and homes.
+Run: python3 -B -m unittest discover -s install -p 'test_*.py' -v
+"""
+
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location(
+    "source_install", HERE / "source_install.py"
+)
+installer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(installer)
+
+FAKE_TOOL = """import json, os, pathlib, sys
+name = pathlib.Path(sys.argv[0]).name
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write(json.dumps([name] + sys.argv[1:]) + "\\n")
+if name == "ghx":
+    if sys.argv[1:3] == ["remote", "list"]:
+        print("origin          " + os.environ.get("FAKE_ORIGIN", "https://github.com/Hexadecimall/lma.git"))
+    elif sys.argv[1] == "status":
+        print(os.environ.get("FAKE_STATUS", "working tree clean"))
+    elif sys.argv[1] == "pull" and os.environ.get("FAKE_PULL_FAIL"):
+        sys.exit(4)
+if name == "cargo":
+    binary = sys.argv[sys.argv.index("--bin") + 1]
+    if os.environ.get("FAKE_BUILD_FAIL") == binary:
+        sys.exit(8)
+    target = pathlib.Path(sys.argv[sys.argv.index("--target-dir") + 1]) / "release"
+    target.mkdir(parents=True, exist_ok=True)
+    suffix = ".exe" if os.environ.get("FAKE_SYSTEM") == "Windows" else ""
+    output = target / (binary + suffix)
+    output.write_text("new " + binary)
+    output.chmod(0o755)
+"""
+
+
+@unittest.skipIf(
+    os.name == "nt",
+    "POSIX fake executable fixtures; Windows paths/staging are simulated",
+)
+class InstallerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="lma-install-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.source = self.base / "source with spaces"
+        self.home = self.base / "home with spaces"
+        self.tools = self.base / "tools"
+        self.log = self.base / "commands.jsonl"
+        for directory in (
+            self.source / "install",
+            self.source / "desktop",
+            self.home,
+            self.tools,
+        ):
+            directory.mkdir(parents=True)
+        for name in ("source_install.py", "install.sh", "Info.plist"):
+            shutil.copy2(HERE / name, self.source / "install" / name)
+        for name in ("Cargo.toml", "Cargo.lock", "desktop/Cargo.toml"):
+            (self.source / name).write_text("fixture")
+        for tool in (
+            "cargo",
+            "rustc",
+            "cmake",
+            "cc",
+            "pkg-config",
+            "xcrun",
+            "codesign",
+            "ghx",
+            "nvcc",
+        ):
+            path = self.tools / tool
+            path.write_text("#!" + sys.executable + "\n" + FAKE_TOOL)
+            path.chmod(0o755)
+        self.env = {
+            "HOME": str(self.home),
+            "PATH": str(self.tools) + os.pathsep + os.environ.get("PATH", ""),
+            "XDG_CONFIG_HOME": str(self.home / "config"),
+            "XDG_DATA_HOME": str(self.home / "data"),
+            "APPDATA": str(self.home / "roaming"),
+            "LOCALAPPDATA": str(self.home / "local"),
+            "FAKE_LOG": str(self.log),
+            "FAKE_SYSTEM": "Linux",
+        }
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.dict(os.environ, self.env))
+        self.stack.enter_context(
+            patch.object(
+                installer, "__file__", str(self.source / "install/source_install.py")
+            )
+        )
+        self.output = io.StringIO()
+        self.stack.enter_context(contextlib.redirect_stdout(self.output))
+
+    def invoke(self, *args, system="Linux"):
+        with (
+            patch.object(installer.platform, "system", return_value=system),
+            patch.dict(os.environ, {"FAKE_SYSTEM": system}),
+        ):
+            installer.main(list(args))
+
+    def commands(self):
+        return (
+            [json.loads(line) for line in self.log.read_text().splitlines()]
+            if self.log.exists()
+            else []
+        )
+
+    def snapshot(self):
+        return sorted(str(p.relative_to(self.base)) for p in self.base.rglob("*"))
+
+    def test_dry_run_writes_nothing(self):
+        before = self.snapshot()
+        self.invoke("--dry-run", "--cuda", "--jobs", "3")
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(self.commands(), [])
+        self.assertIn("--locked --release --jobs 3", self.output.getvalue())
+
+    def test_linux_build_and_registration(self):
+        self.invoke()
+        config_path = self.home / ".lma/source-install.json"
+        config = json.loads(config_path.read_text())
+        self.assertEqual(config["schema_version"], 1)
+        self.assertEqual(config["source_dir"], str(self.source))
+        self.assertEqual(config["backend"], "cpu")
+        self.assertEqual(config["jobs"], 2)
+        self.assertEqual((self.home / ".local/bin/lma").read_text(), "new lma")
+        self.assertEqual(
+            (self.home / ".local/bin/lma-desktop").read_text(), "new lma-desktop"
+        )
+        entry = (self.home / "data/applications/org.lma.app.desktop").read_text()
+        self.assertIn('Exec="' + str(self.home), entry)
+        commands = [c for c in self.commands() if c[0] == "cargo"]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            for flag in ("--locked", "--release", "--no-default-features"):
+                self.assertIn(flag, command)
+            self.assertEqual(
+                command[command.index("--target-dir") + 1], str(self.source / "target")
+            )
+        self.assertIn("vision,image-gen,speech", commands[0])
+        self.assertIn("tauri/custom-protocol", commands[1])
+
+    def test_mac_bundle_and_metal(self):
+        self.invoke(system="Darwin")
+        app = self.home / "Applications/lma.app"
+        self.assertEqual(
+            (app / "Contents/MacOS/lma-desktop").read_text(), "new lma-desktop"
+        )
+        self.assertIn("org.lma.app", (app / "Contents/Info.plist").read_text())
+        self.assertTrue(
+            (
+                self.home
+                / ".lma/source-install.json"
+            ).exists()
+        )
+        commands = self.commands()
+        self.assertIn(
+            "vision,image-gen,speech,metal",
+            next(c for c in commands if c[0] == "cargo"),
+        )
+        self.assertEqual(len([c for c in commands if c[0] == "codesign"]), 2)
+        with self.assertRaisesRegex(RuntimeError, "always enables Metal"):
+            self.invoke("--cpu", system="Darwin")
+
+    def test_cuda_and_saved_update_settings(self):
+        self.invoke("--cuda", "--jobs", "3")
+        self.log.unlink()
+        self.invoke("--update")
+        commands = self.commands()
+        self.assertIn(["ghx", "pull", "origin"], commands)
+        builds = [c for c in commands if c[0] == "cargo"]
+        self.assertIn("vision,image-gen,speech,cuda", builds[0])
+        self.assertIn("cuda", builds[1])
+        self.assertEqual(builds[0][builds[0].index("--jobs") + 1], "3")
+        self.assertLess(
+            commands.index(["ghx", "status"]), commands.index(["ghx", "pull", "origin"])
+        )
+
+    def test_update_dry_run_never_pulls_or_builds(self):
+        self.invoke("--update", "--dry-run")
+        self.assertEqual(
+            self.commands(), [["ghx", "remote", "list"], ["ghx", "status"]]
+        )
+        self.assertFalse((self.source / "target").exists())
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_dirty_untracked_and_unknown_status_fail_closed(self):
+        for status in (
+            "unstaged   modified   Cargo.toml",
+            "unstaged   new   surprise",
+            "",
+            "clean",
+        ):
+            with (
+                self.subTest(status=status),
+                patch.dict(os.environ, {"FAKE_STATUS": status}),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "dirty or ghx status is unrecognized"
+                ):
+                    self.invoke("--update")
+        self.assertFalse(
+            any(c[0] == "cargo" or c[:2] == ["ghx", "pull"] for c in self.commands())
+        )
+
+    def test_wrong_origin_and_pull_failure_never_build(self):
+        with patch.dict(os.environ, {"FAKE_ORIGIN": "https://example.com/other.git"}):
+            with self.assertRaisesRegex(RuntimeError, "origin must be exactly"):
+                self.invoke("--update")
+        self.assertNotIn(["ghx", "pull", "origin"], self.commands())
+        with patch.dict(os.environ, {"FAKE_PULL_FAIL": "1"}):
+            with self.assertRaisesRegex(RuntimeError, "ghx failed"):
+                self.invoke("--update")
+        self.assertFalse(any(c[0] == "cargo" for c in self.commands()))
+
+    def test_failed_second_build_leaves_existing_install_untouched(self):
+        self.invoke()
+        cli = self.home / ".local/bin/lma"
+        cli.write_text("old cli")
+        config = self.home / ".lma/source-install.json"
+        original = config.read_bytes()
+        with patch.dict(os.environ, {"FAKE_BUILD_FAIL": "lma-desktop"}):
+            with self.assertRaisesRegex(RuntimeError, "cargo failed"):
+                self.invoke()
+        self.assertEqual(cli.read_text(), "old cli")
+        self.assertEqual(config.read_bytes(), original)
+        self.assertFalse((self.source / "target/.source-install-lock").exists())
+
+    def test_publish_failure_rolls_back_all_items(self):
+        src, first, second = (
+            self.base / "new",
+            self.base / "first",
+            self.base / "second",
+        )
+        src.write_text("new")
+        first.write_text("old first")
+        second.mkdir()
+        (second / "old").write_text("old directory")
+        original = os.replace
+
+        def fail_second(source, destination):
+            if Path(destination) == second and Path(source).name == "new":
+                raise OSError("injected publish failure")
+            return original(source, destination)
+
+        with patch.object(installer.os, "replace", side_effect=fail_second):
+            with self.assertRaisesRegex(OSError, "injected"):
+                installer.publish([(src, first), (src, second)])
+        self.assertEqual(first.read_text(), "old first")
+        self.assertEqual((second / "old").read_text(), "old directory")
+        self.assertFalse(list(self.base.glob(".lma-install-*")))
+
+    def test_windows_locked_executable_is_staged_and_applied(self):
+        self.invoke(system="Windows")
+        binary = self.home / "local/lma/bin/lma-desktop.exe"
+        binary.write_text("running old desktop")
+        original = os.replace
+
+        def locked(source, destination):
+            if Path(destination) == binary and Path(source).name == "new":
+                raise PermissionError("running exe")
+            return original(source, destination)
+
+        with patch.object(installer.os, "replace", side_effect=locked):
+            with self.assertRaisesRegex(RuntimeError, "--apply-staged"):
+                self.invoke(system="Windows")
+        self.assertEqual(binary.read_text(), "running old desktop")
+        self.assertTrue(
+            (self.home / "local/lma/pending-update/lma-desktop.exe").exists()
+        )
+        self.log.unlink()
+        self.invoke("--apply-staged", system="Windows")
+        self.assertEqual(binary.read_text(), "new lma-desktop")
+        self.assertEqual(self.commands(), [])
+        self.assertFalse((self.home / "local/lma/pending-update").exists())
+
+    def test_lock_and_invalid_jobs(self):
+        lock = self.source / "target/.source-install-lock"
+        lock.mkdir(parents=True)
+        with self.assertRaisesRegex(RuntimeError, "Another installer"):
+            self.invoke()
+        for jobs in ("0", "65", "-1"):
+            with self.assertRaisesRegex(RuntimeError, "--jobs must"):
+                self.invoke("--jobs", jobs)
+        self.assertTrue(lock.exists())
+        self.assertFalse(any(c[0] == "cargo" for c in self.commands()))
+
+    def test_malformed_or_redirected_registration_refused(self):
+        config = self.home / ".lma/source-install.json"
+        config.parent.mkdir(parents=True)
+        for value in ([], {}, {"schema_version": 2, "source_dir": str(self.source)}):
+            config.write_text(json.dumps(value))
+            with self.assertRaisesRegex(RuntimeError, "checkout/schema"):
+                self.invoke("--update")
+        config.write_text(" " * 65537)
+        with self.assertRaisesRegex(RuntimeError, "exceeds 64 KiB"):
+            self.invoke("--update")
+        config.unlink()
+        config.symlink_to(self.source / "Cargo.toml")
+        with self.assertRaisesRegex(RuntimeError, "non-symlink"):
+            self.invoke("--update")
+        self.assertEqual(self.commands(), [])
+
+    def test_symlink_destination_refused(self):
+        src, dest = self.base / "src", self.base / "dest"
+        src.write_text("keep")
+        dest.symlink_to(src)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            installer.publish([(src, dest)])
+        self.assertEqual(src.read_text(), "keep")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,1032 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="color-scheme" content="dark" />
+        <title>lma</title>
+        <link rel="stylesheet" href="style.css" />
+        <script type="module" src="app.js"></script>
+    </head>
+    <body>
+        <div id="workspace" class="workspace">
+            <aside class="sidebar" aria-label="Workspace navigation">
+                <nav class="primary-nav" aria-label="Main">
+                    <button
+                        id="nav-chat"
+                        class="nav-button"
+                        aria-current="page"
+                    >
+                        <span id="chat-icon"></span>Chat
+                    </button>
+                    <button id="nav-models" class="nav-button">
+                        <span id="models-icon"></span>Models<span
+                            id="model-count"
+                            class="nav-count"
+                        ></span>
+                    </button>
+                    <button id="nav-settings" class="nav-button">
+                        <span id="settings-icon" aria-hidden="true">
+                            <svg
+                                class="icon"
+                                viewBox="0 0 24 24"
+                                aria-hidden="true"
+                            >
+                                <path d="M4 7h16M4 17h16" />
+                                <rect
+                                    x="8"
+                                    y="4"
+                                    width="4"
+                                    height="6"
+                                    rx="1.5"
+                                />
+                                <rect
+                                    x="14"
+                                    y="14"
+                                    width="4"
+                                    height="6"
+                                    rx="1.5"
+                                />
+                            </svg>
+                        </span>
+                        Settings
+                    </button>
+                </nav>
+                <div
+                    class="history-controls"
+                    role="group"
+                    aria-label="Conversation history"
+                >
+                    <div class="history-divider" aria-hidden="true"></div>
+                    <button
+                        id="history-search-toggle"
+                        type="button"
+                        class="icon-button"
+                        aria-label="Search conversations"
+                        title="Search conversations"
+                        aria-controls="history-search-field"
+                        aria-expanded="false"
+                    >
+                        <svg
+                            class="icon"
+                            viewBox="0 0 24 24"
+                            aria-hidden="true"
+                        >
+                            <circle cx="10.5" cy="10.5" r="6.5" />
+                            <path d="m16 16 4 4" />
+                        </svg>
+                    </button>
+                    <button
+                        id="new-chat"
+                        type="button"
+                        class="icon-button"
+                        aria-label="New conversation"
+                        title="New conversation"
+                    ></button>
+                </div>
+                <label
+                    id="history-search-field"
+                    class="search-field history-search"
+                    hidden
+                    ><span id="history-search-icon"></span
+                    ><input
+                        id="conversation-search"
+                        type="search"
+                        placeholder="Search conversations"
+                        aria-label="Search saved conversations"
+                /></label>
+                <div
+                    id="conversation-list"
+                    class="conversation-list"
+                    aria-label="Saved conversations"
+                ></div>
+                <div class="sidebar-foot">
+                    <span
+                        id="save-state"
+                        class="save-state"
+                        role="status"
+                    ></span>
+                </div>
+            </aside>
+            <main class="main">
+                <header class="workspace-header">
+                    <div class="header-title">
+                        <span id="view-label" hidden>Chat</span>
+                        <h1 id="conversation-title">New conversation</h1>
+                    </div>
+                    <div class="header-actions">
+                        <button
+                            id="conversation-options"
+                            class="icon-button"
+                            title="Conversation options"
+                            aria-label="Conversation options"
+                            aria-controls="inspector"
+                            aria-expanded="false"
+                        ></button>
+                    </div>
+                </header>
+                <div
+                    id="persistence-error"
+                    class="notice persistence-notice"
+                    role="alert"
+                    hidden
+                >
+                    <span id="persistence-error-text"></span
+                    ><button id="persistence-retry" class="text-button">
+                        Retry
+                    </button>
+                </div>
+                <div id="app-error" class="notice" role="alert" hidden>
+                    <span id="app-error-text"></span
+                    ><button
+                        id="dismiss-error"
+                        class="icon-button"
+                        aria-label="Dismiss error"
+                    ></button>
+                </div>
+                <div class="main-body">
+                    <section
+                        id="chat-view"
+                        class="chat-view"
+                        aria-label="Conversation"
+                    >
+                        <div id="message-scroll" class="message-scroll">
+                            <div id="welcome-view" class="welcome-view">
+                                <h2>What do you want to work on today?</h2>
+                            </div>
+                            <div id="messages" class="messages"></div>
+                        </div>
+                        <div class="composer-dock">
+                            <div
+                                id="request-error"
+                                class="request-error"
+                                role="alert"
+                                hidden
+                            >
+                                <span id="request-error-text"></span
+                                ><button id="retry-request" class="text-button">
+                                    Retry
+                                </button>
+                            </div>
+                            <div
+                                id="dictation-setup"
+                                class="dictation-setup"
+                                hidden
+                            >
+                                <div class="dictation-heading">
+                                    <h3>Dictation</h3>
+                                    <button
+                                        id="dictation-close-setup"
+                                        type="button"
+                                        class="text-button"
+                                    >
+                                        Done
+                                    </button>
+                                </div>
+                                <label for="dictation-installed-models"
+                                    >Installed speech models</label
+                                >
+                                <div class="dictation-model-row">
+                                    <select
+                                        id="dictation-installed-models"
+                                        aria-describedby="dictation-models-status"
+                                    ></select>
+                                    <button
+                                        id="dictation-use-installed"
+                                        type="button"
+                                        class="text-button"
+                                    >
+                                        Use selected
+                                    </button>
+                                    <button
+                                        id="dictation-rescan-models"
+                                        type="button"
+                                        class="text-button"
+                                    >
+                                        Refresh
+                                    </button>
+                                </div>
+                                <p
+                                    id="dictation-models-status"
+                                    role="status"
+                                    aria-live="polite"
+                                ></p>
+                                <details class="dictation-details">
+                                    <summary>Download a speech model</summary>
+                                    <label for="dictation-repository"
+                                        >Hugging Face repository</label
+                                    >
+                                    <input
+                                        id="dictation-repository"
+                                        type="text"
+                                        placeholder="owner/repository"
+                                        aria-describedby="dictation-install-note"
+                                        maxlength="257"
+                                        spellcheck="false"
+                                        autocomplete="off"
+                                    />
+                                    <div class="dictation-install-row">
+                                        <button
+                                            id="dictation-install-model"
+                                            type="button"
+                                            class="text-button"
+                                            aria-describedby="dictation-install-note"
+                                        >
+                                            Inspect download
+                                        </button>
+                                        <span id="dictation-install-note"
+                                            >Inspect Hugging Face metadata
+                                            first, then explicitly install the
+                                            listed files. No automatic
+                                            downloads. Audio stays local.</span
+                                        >
+                                    </div>
+                                    <div id="dictation-plan" hidden>
+                                        <p id="dictation-plan-summary"></p>
+                                        <ul id="dictation-plan-files"></ul>
+                                        <p id="dictation-plan-directory"></p>
+                                    </div>
+                                </details>
+                                <details class="dictation-details">
+                                    <summary>
+                                        Use a local speech model folder
+                                    </summary>
+                                    <label for="dictation-model-path"
+                                        >Or use a local Hugging Face Whisper
+                                        directory</label
+                                    >
+                                    <div class="dictation-model-row">
+                                        <input
+                                            id="dictation-model-path"
+                                            type="text"
+                                            placeholder="/path/to/speech-model"
+                                            aria-describedby="dictation-model-note"
+                                            maxlength="4096"
+                                            spellcheck="false"
+                                            autocomplete="off"
+                                        />
+                                        <button
+                                            id="dictation-save-model"
+                                            type="button"
+                                            class="text-button"
+                                        >
+                                            Use model
+                                        </button>
+                                    </div>
+                                    <p id="dictation-model-note">
+                                        Requires config.json, tokenizer.json and
+                                        model.safetensors — not a GGML/GGUF
+                                        file. Currently supports model_type:
+                                        whisper only; repository architecture is
+                                        checked after installation. Recordings
+                                        stay on this device and only add text to
+                                        your draft.
+                                    </p>
+                                </details>
+                            </div>
+                            <div
+                                id="dictation-feedback"
+                                class="dictation-feedback"
+                                hidden
+                            >
+                                <span
+                                    id="dictation-status"
+                                    role="status"
+                                    aria-live="polite"
+                                    aria-atomic="true"
+                                ></span>
+                                <span
+                                    id="dictation-elapsed"
+                                    aria-label="Elapsed time"
+                                ></span>
+                                <span id="dictation-error" role="alert"></span>
+                            </div>
+                            <form id="composer-form" class="composer">
+                                <div
+                                    id="attachments"
+                                    class="attachments"
+                                    hidden
+                                ></div>
+                                <label for="draft" class="sr-only"
+                                    >Message</label
+                                ><textarea
+                                    id="draft"
+                                    rows="2"
+                                    placeholder="Message your model…"
+                                    spellcheck="true"
+                                ></textarea>
+                                <div class="composer-toolbar">
+                                    <div class="composer-tools">
+                                        <div class="composer-model-picker">
+                                            <label
+                                                class="sr-only"
+                                                for="model-quick-switch"
+                                                >Active model</label
+                                            >
+                                            <select
+                                                id="model-quick-switch"
+                                                title="Model"
+                                                aria-label="Active model"
+                                            >
+                                                <option value="">
+                                                    Select model
+                                                </option>
+                                            </select>
+                                            <span
+                                                id="model-quick-switch-label"
+                                                aria-hidden="true"
+                                                >Select model</span
+                                            >
+                                            <svg
+                                                class="icon model-picker-chevron"
+                                                viewBox="0 0 24 24"
+                                                aria-hidden="true"
+                                            >
+                                                <path d="m7 10 5 5 5-5" />
+                                            </svg>
+                                        </div>
+                                        <button
+                                            id="attach-image"
+                                            type="button"
+                                            class="icon-button"
+                                            aria-label="Attach PNG or JPEG"
+                                            title="Attach PNG or JPEG"
+                                        ></button
+                                        ><button
+                                            id="dictation-toggle"
+                                            type="button"
+                                            class="icon-button"
+                                            aria-label="Start dictation"
+                                            aria-pressed="false"
+                                            aria-keyshortcuts="Control+Shift+D Meta+Shift+D"
+                                            title="Dictate (Ctrl/Cmd+Shift+D)"
+                                        ></button
+                                        ><button
+                                            id="dictation-configure"
+                                            type="button"
+                                            class="icon-button"
+                                            aria-label="Dictation model"
+                                            aria-expanded="false"
+                                            aria-controls="dictation-setup"
+                                            title="Dictation model"
+                                        ></button
+                                        ><span
+                                            id="composer-mode"
+                                            class="mode-label"
+                                            hidden
+                                            >Chat</span
+                                        >
+                                    </div>
+                                    <div class="composer-send">
+                                        <span id="composer-hint" hidden></span>
+                                        <button
+                                            id="stop"
+                                            type="button"
+                                            class="icon-button"
+                                            aria-label="Stop generation"
+                                            title="Stop generation"
+                                            hidden
+                                        ></button
+                                        ><button
+                                            id="send"
+                                            type="submit"
+                                            class="icon-button send-button"
+                                            aria-label="Send message"
+                                            title="Send message"
+                                        ></button>
+                                    </div>
+                                </div>
+                                <input
+                                    id="image-input"
+                                    type="file"
+                                    accept="image/png,image/jpeg"
+                                    multiple
+                                    hidden
+                                />
+                            </form>
+                            <div class="composer-caption" hidden>
+                                <span id="model-state">Checking model…</span
+                                ><button id="open-library" class="text-button">
+                                    Model library
+                                    <span aria-hidden="true">↗</span>
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+                    <section
+                        id="models-view"
+                        class="models-view"
+                        aria-label="Model library"
+                        hidden
+                    >
+                        <div class="library-top">
+                            <h2>Models</h2>
+                            <div class="library-actions">
+                                <button
+                                    id="toggle-manual-model"
+                                    type="button"
+                                    class="secondary-button import-button"
+                                    aria-expanded="false"
+                                    aria-controls="manual-import"
+                                >
+                                    <svg
+                                        class="icon"
+                                        viewBox="0 0 24 24"
+                                        aria-hidden="true"
+                                    >
+                                        <path
+                                            d="M12 16V4m-4 4 4-4 4 4M5 14v5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5"
+                                        />
+                                    </svg>
+                                    Import model
+                                </button>
+                            </div>
+                        </div>
+                        <div
+                            class="model-tabs"
+                            role="tablist"
+                            aria-label="Model library"
+                        >
+                            <button
+                                id="models-installed-tab"
+                                type="button"
+                                role="tab"
+                                aria-controls="installed-models-panel"
+                                aria-selected="true"
+                                tabindex="0"
+                            >
+                                Installed
+                            </button>
+                            <button
+                                id="models-store-tab"
+                                type="button"
+                                role="tab"
+                                aria-controls="store-models-panel"
+                                aria-selected="false"
+                                tabindex="-1"
+                            >
+                                Store
+                            </button>
+                        </div>
+                        <div
+                            id="installed-models-panel"
+                            class="model-tab-panel"
+                            role="tabpanel"
+                            aria-labelledby="models-installed-tab"
+                            tabindex="0"
+                        >
+                            <label class="search-field model-search"
+                                ><span id="model-search-icon"> </span
+                                ><input
+                                    id="model-search"
+                                    type="search"
+                                    aria-label="Search installed models"
+                                    placeholder="Search models or sources…"
+                            /></label>
+                            <div
+                                id="discovery-warning"
+                                class="notice"
+                                role="status"
+                                hidden
+                            ></div>
+                            <div
+                                id="installed-models"
+                                class="installed-models"
+                                aria-label="Installed models"
+                            ></div>
+                            <div id="load-panel" class="load-panel">
+                                <div class="load-card-header">
+                                    <div class="load-selection">
+                                        <strong id="selected-model-name"
+                                            >No model selected</strong
+                                        >
+                                        <details class="model-path-details">
+                                            <summary>Model path</summary>
+                                            <span
+                                                id="selected-model-path"
+                                                class="model-path"
+                                            ></span>
+                                        </details>
+                                    </div>
+                                    <button
+                                        id="load-model"
+                                        type="button"
+                                        class="primary-button"
+                                    >
+                                        Load model
+                                    </button>
+                                    <button
+                                        id="unload-model"
+                                        type="button"
+                                        hidden
+                                    >
+                                        Unload
+                                    </button>
+                                </div>
+                                <div class="model-delete-controls">
+                                    <button
+                                        id="delete-model"
+                                        type="button"
+                                        class="secondary-button danger"
+                                        aria-describedby="delete-model-note"
+                                        disabled
+                                    >
+                                        Delete model
+                                    </button>
+                                    <p
+                                        id="delete-model-note"
+                                        class="field-note"
+                                    >
+                                        Unload the loaded model first. Models
+                                        can only be deleted when no model is
+                                        loaded.
+                                    </p>
+                                </div>
+                                <button
+                                    id="open-settings"
+                                    type="button"
+                                    class="text-button load-policy-link"
+                                    aria-controls="settings-view"
+                                >
+                                    <span id="load-policy-preview"
+                                        >Automatic</span
+                                    >
+                                    <span aria-hidden="true">↗</span>
+                                </button>
+                                <details
+                                    id="model-advanced"
+                                    class="model-advanced"
+                                    hidden
+                                >
+                                    <summary>Load options</summary>
+                                    <div class="load-controls">
+                                        <label for="load-gpu"
+                                            >GPU layers
+                                            <input
+                                                id="load-gpu"
+                                                value="auto"
+                                                list="gpu-options"
+                                            />
+                                        </label>
+                                        <datalist id="gpu-options">
+                                            <option value="auto"></option>
+                                            <option value="cpu"></option>
+                                            <option value="all"></option>
+                                        </datalist>
+                                        <label for="load-context"
+                                            >Context tokens
+                                            <input
+                                                id="load-context"
+                                                type="number"
+                                                min="1"
+                                                max="4294967295"
+                                                value="4096"
+                                            />
+                                        </label>
+                                    </div>
+                                </details>
+                            </div>
+                        </div>
+                        <div
+                            id="store-models-panel"
+                            class="model-tab-panel"
+                            role="tabpanel"
+                            aria-labelledby="models-store-tab"
+                            tabindex="0"
+                            hidden
+                        >
+                            <form
+                                id="store-search-form"
+                                class="store-search-form"
+                                role="search"
+                                aria-label="Search model store"
+                            >
+                                <label class="search-field store-search-field">
+                                    <svg
+                                        class="icon"
+                                        viewBox="0 0 24 24"
+                                        aria-hidden="true"
+                                    >
+                                        <circle cx="10.5" cy="10.5" r="6.5" />
+                                        <path d="m16 16 4 4" />
+                                    </svg>
+                                    <input
+                                        id="store-query"
+                                        type="search"
+                                        placeholder="Search models…"
+                                        aria-label="Search store models"
+                                    />
+                                </label>
+                                <label class="sr-only" for="store-source"
+                                    >Model source</label
+                                >
+                                <select id="store-source">
+                                    <option value="all">All sources</option>
+                                    <option value="ollama">Ollama</option>
+                                    <option value="lm-studio">
+                                        Hugging Face / LM Studio
+                                    </option>
+                                </select>
+                                <button
+                                    id="store-search"
+                                    type="submit"
+                                    class="primary-button"
+                                >
+                                    Search
+                                </button>
+                            </form>
+                            <div class="store-status-row">
+                                <span
+                                    id="store-status"
+                                    class="field-note"
+                                    role="status"
+                                    aria-live="polite"
+                                ></span>
+                            </div>
+                            <div
+                                id="store-results"
+                                class="store-results"
+                                aria-label="Model store results"
+                            ></div>
+                        </div>
+                        <form id="manual-import" class="manual-import" hidden>
+                            <h3>Import model</h3>
+                            <label
+                                >Source<select id="manual-source">
+                                    <option value="lma">lma / GGUF path</option>
+                                    <option value="ollama">Ollama name</option>
+                                </select></label
+                            ><label
+                                >Model path or name<input
+                                    id="manual-model"
+                                    placeholder="/path/to/model.gguf"
+                                    required /></label
+                            ><label
+                                >Name <span class="muted">optional</span>
+                                <input
+                                    id="manual-name"
+                                    autocomplete="off"
+                                    spellcheck="false" /></label
+                            ><label
+                                >Ollama directory
+                                <span class="muted">optional</span
+                                ><input id="manual-ollama-dir" /></label
+                            ><label
+                                >Vision projector
+                                <span class="muted">optional</span
+                                ><input id="manual-projector"
+                            /></label>
+                            <div class="manual-footer">
+                                <span></span
+                                ><button
+                                    class="primary-button"
+                                    type="submit"
+                                    id="manual-load"
+                                >
+                                    Import model
+                                </button>
+                            </div>
+                        </form>
+                    </section>
+                    <section
+                        id="settings-view"
+                        class="settings-view"
+                        aria-label="Application settings"
+                        hidden
+                    >
+                        <div class="settings-page-heading">
+                            <h2>Settings</h2>
+                        </div>
+                        <form id="app-settings-form" class="app-settings-form">
+                            <section
+                                class="settings-section"
+                                aria-labelledby="loading-settings-heading"
+                            >
+                                <div class="settings-section-heading">
+                                    <h3 id="loading-settings-heading">
+                                        Model loading
+                                    </h3>
+                                </div>
+                                <label for="app-load-policy"
+                                    >Load policy
+                                    <select
+                                        id="app-load-policy"
+                                        aria-describedby="load-policy-note"
+                                    >
+                                        <option value="automatic">
+                                            Automatic
+                                        </option>
+                                        <option value="defaults">
+                                            Defaults file
+                                        </option>
+                                        <option value="manual">Manual</option>
+                                    </select>
+                                </label>
+                                <p id="load-policy-note" class="field-note">
+                                    Automatic uses the default GPU and context
+                                    options. Manual gives you control of GPU
+                                    layers and context.
+                                </p>
+                                <div id="app-defaults-row" hidden>
+                                    <label for="app-defaults-path"
+                                        >Defaults file
+                                        <input
+                                            id="app-defaults-path"
+                                            type="text"
+                                            placeholder="/path/to/defaults.json"
+                                            spellcheck="false"
+                                            autocomplete="off"
+                                        />
+                                    </label>
+                                </div>
+                                <div
+                                    id="app-manual-load-fields"
+                                    class="field-grid"
+                                    hidden
+                                >
+                                    <label for="app-gpu"
+                                        >GPU layers
+                                        <input
+                                            id="app-gpu"
+                                            type="text"
+                                            value="auto"
+                                            list="gpu-options"
+                                            spellcheck="false"
+                                        />
+                                    </label>
+                                    <label for="app-context"
+                                        >Context tokens
+                                        <input
+                                            id="app-context"
+                                            type="number"
+                                            min="1"
+                                            max="4294967295"
+                                            value="4096"
+                                        />
+                                    </label>
+                                </div>
+                                <label
+                                    class="check-field"
+                                    for="app-auto-restore"
+                                >
+                                    <input
+                                        id="app-auto-restore"
+                                        type="checkbox"
+                                    />
+                                    Restore the last model when the app opens
+                                </label>
+                            </section>
+                            <section
+                                class="settings-section"
+                                aria-labelledby="model-locations-heading"
+                            >
+                                <div class="settings-section-heading">
+                                    <h3 id="model-locations-heading">
+                                        Model locations
+                                    </h3>
+                                    <p class="field-note">
+                                        Additional folders to include in your
+                                        library. One path per line.
+                                    </p>
+                                </div>
+                                <label for="app-model-dirs"
+                                    >Model folders
+                                    <textarea
+                                        id="app-model-dirs"
+                                        rows="3"
+                                        placeholder="/path/to/models"
+                                        spellcheck="false"
+                                        autocomplete="off"
+                                    ></textarea>
+                                </label>
+                                <label for="app-ollama-dir"
+                                    >Ollama directory
+                                    <input
+                                        id="app-ollama-dir"
+                                        type="text"
+                                        placeholder="Use the default location"
+                                        spellcheck="false"
+                                        autocomplete="off"
+                                    />
+                                </label>
+                                <label for="app-lm-studio-dirs"
+                                    >LM Studio folders
+                                    <textarea
+                                        id="app-lm-studio-dirs"
+                                        rows="3"
+                                        placeholder="Use the default locations"
+                                        spellcheck="false"
+                                        autocomplete="off"
+                                    ></textarea>
+                                </label>
+                            </section>
+                            <div class="settings-save-row">
+                                <span
+                                    id="app-settings-status"
+                                    class="field-note"
+                                    role="status"
+                                    aria-live="polite"
+                                ></span>
+                                <button
+                                    id="save-app-settings"
+                                    type="submit"
+                                    class="primary-button"
+                                >
+                                    Save settings
+                                </button>
+                            </div>
+                        </form>
+                        <section
+                            class="settings-section update-section"
+                            aria-labelledby="application-settings-heading"
+                        >
+                            <div class="settings-section-heading">
+                                <h3 id="application-settings-heading">
+                                    Application
+                                </h3>
+                                <span
+                                    id="model-backend"
+                                    class="field-note"
+                                    role="status"
+                                ></span>
+                            </div>
+                            <div class="update-heading">
+                                <span>Source update</span>
+                                <span id="update-state" class="badge"
+                                    >Idle</span
+                                >
+                            </div>
+                            <div class="update-action-row">
+                                <button
+                                    id="source-update"
+                                    type="button"
+                                    class="secondary-button"
+                                >
+                                    Update application…
+                                </button>
+                                <p class="field-note">
+                                    Builds from source. Your model will be
+                                    unloaded.
+                                </p>
+                            </div>
+                            <div
+                                id="update-error"
+                                class="field-error"
+                                role="alert"
+                                hidden
+                            ></div>
+                            <pre
+                                id="update-log"
+                                class="update-log"
+                                tabindex="0"
+                                aria-label="Application update log"
+                                hidden
+                            ></pre>
+                        </section>
+                    </section>
+                    <aside
+                        id="inspector"
+                        class="inspector"
+                        aria-label="Conversation options"
+                        hidden
+                    >
+                        <div class="inspector-heading">
+                            <h2>Conversation options</h2>
+                            <button
+                                id="close-inspector"
+                                class="icon-button"
+                                aria-label="Close conversation options"
+                            ></button>
+                        </div>
+                        <div class="inspector-scroll">
+                            <section class="inspector-section">
+                                <label
+                                    >Title<input
+                                        id="rename-title"
+                                        maxlength="256"
+                                /></label>
+                                <div class="button-row">
+                                    <button
+                                        id="rename-conversation"
+                                        class="secondary-button"
+                                    >
+                                        Rename</button
+                                    ><button
+                                        id="delete-conversation"
+                                        class="text-button danger"
+                                    >
+                                        Delete
+                                    </button>
+                                </div>
+                            </section>
+                            <form id="settings-form" class="inspector-section">
+                                <h3>Generation</h3>
+                                <label
+                                    >Mode<select id="setting-mode">
+                                        <option value="chat">Chat</option>
+                                        <option value="raw">
+                                            Raw completion
+                                        </option>
+                                    </select></label
+                                >
+                                <p id="raw-note" class="field-note" hidden>
+                                    Raw sends only the current prompt, without
+                                    history, system instructions, or images.
+                                </p>
+                                <div class="field-grid">
+                                    <label
+                                        >Output tokens<input
+                                            id="setting-max-tokens"
+                                            type="number"
+                                            min="1"
+                                            max="4294967295" /></label
+                                    ><label
+                                        >Temperature<input
+                                            id="setting-temperature"
+                                            type="number"
+                                            min="0"
+                                            max="2"
+                                            step="0.05" /></label
+                                    ><label
+                                        >Top P<input
+                                            id="setting-top-p"
+                                            type="number"
+                                            min="0.001"
+                                            max="1"
+                                            step="0.01" /></label
+                                    ><label
+                                        >Seed<input
+                                            id="setting-seed"
+                                            type="number"
+                                            min="0"
+                                            max="4294967295"
+                                            placeholder="Random"
+                                    /></label>
+                                </div>
+                                <label
+                                    >System instructions<textarea
+                                        id="setting-system"
+                                        rows="5"
+                                        placeholder="Optional instructions for this conversation"
+                                    ></textarea></label
+                                ><label class="check-field"
+                                    ><input
+                                        id="setting-coding"
+                                        type="checkbox"
+                                    />Coding instructions</label
+                                >
+                                <div
+                                    id="settings-error"
+                                    class="field-error"
+                                    role="alert"
+                                    hidden
+                                ></div>
+                                <span class="field-note"
+                                    >Changes save automatically.</span
+                                >
+                            </form>
+                            <section class="inspector-section">
+                                <h3>Export conversation</h3>
+                                <div class="button-row">
+                                    <button
+                                        id="export-json"
+                                        class="secondary-button"
+                                    >
+                                        JSON</button
+                                    ><button
+                                        id="export-markdown"
+                                        class="secondary-button"
+                                    >
+                                        Markdown
+                                    </button>
+                                </div>
+                            </section>
+                        </div>
+                    </aside>
+                </div>
+            </main>
+        </div>
+        <div
+            id="notifications"
+            class="notifications"
+            role="status"
+            aria-live="polite"
+            aria-relevant="additions text"
+            aria-label="Notifications"
+        ></div>
+        <div class="legacy-controls" hidden aria-hidden="true">
+            <button
+                id="manual-toggle"
+                type="button"
+                aria-controls="manual-import"
+                aria-expanded="false"
+                tabindex="-1"
+            >
+                Import model
+            </button>
+            <button id="rescan-models" type="button" tabindex="-1">
+                Rescan
+            </button>
+        </div>
+    </body>
+</html>

@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="color-scheme" content="dark" />
+        <meta name="referrer" content="no-referrer" />
+        <title>lma</title>
+        <link rel="stylesheet" href="/style.css" />
+        <script type="module" src="/chat.js"></script>
+    </head>
+    <body>
+        <a class="skip-link" href="#prompt">Skip to composer</a>
+        <div class="app">
+            <aside id="sidebar" class="sidebar" aria-label="Conversations">
+                <div class="brand-row">
+                    <div class="brand">
+                        <span class="brand-mark" aria-hidden="true">λ</span>lma
+                    </div>
+                    <button
+                        id="close-sidebar"
+                        class="icon-button mobile-only"
+                        type="button"
+                        aria-label="Close conversations"
+                    >
+                        Close
+                    </button>
+                </div>
+                <button id="new-chat" class="new-chat" type="button">
+                    <span aria-hidden="true">＋</span> New conversation
+                </button>
+                <div class="section-label">
+                    Conversations <span id="chat-count">0</span>
+                </div>
+                <nav
+                    id="conversation-list"
+                    class="conversation-list"
+                    aria-label="Choose a conversation"
+                ></nav>
+                <div class="sidebar-bottom">
+                    <span
+                        class="session-label"
+                        title="Chats are not saved. Export before closing."
+                        >Temporary chats</span
+                    >
+                    <button
+                        id="open-settings"
+                        class="icon-button"
+                        type="button"
+                        aria-label="Settings"
+                    >
+                        Settings
+                    </button>
+                </div>
+            </aside>
+            <button
+                id="sidebar-scrim"
+                class="scrim"
+                type="button"
+                aria-label="Close conversations"
+                hidden
+            ></button>
+            <main class="workspace">
+                <header class="topbar">
+                    <button
+                        id="open-sidebar"
+                        class="icon-button mobile-only"
+                        type="button"
+                        aria-label="Open conversations"
+                        aria-controls="sidebar"
+                        aria-expanded="false"
+                    >
+                        Conversations
+                    </button>
+                    <div class="model-toolbar">
+                        <span
+                            id="status-dot"
+                            class="status-dot"
+                            aria-hidden="true"
+                        ></span>
+                        <button
+                            id="model-selector"
+                            class="model-selector"
+                            type="button"
+                            aria-label="Select model"
+                            aria-haspopup="dialog"
+                            hidden
+                        >
+                            <span id="desktop-model-name">Select model</span
+                            ><span class="chevron" aria-hidden="true">⌄</span>
+                        </button>
+                        <span id="model-status" role="status">Connecting…</span>
+                    </div>
+                    <div class="header-actions">
+                        <button
+                            id="refresh-model"
+                            class="icon-button"
+                            type="button"
+                            aria-label="Reconnect"
+                            title="Reconnect"
+                        >
+                            Reconnect
+                        </button>
+                        <button
+                            id="open-export"
+                            class="icon-button"
+                            type="button"
+                            aria-label="Export conversation"
+                            title="Export conversation"
+                        >
+                            Export
+                        </button>
+                    </div>
+                </header>
+                <div class="conversation-bar">
+                    <h1 id="conversation-title">New conversation</h1>
+                    <span id="mode-badge" class="badge">CHAT</span>
+                </div>
+                <div
+                    id="connection-error"
+                    class="connection-error"
+                    role="status"
+                    hidden
+                ></div>
+                <section
+                    id="chat-scroll"
+                    class="chat-scroll"
+                    aria-label="Conversation messages"
+                    tabindex="0"
+                >
+                    <div id="welcome" class="welcome">
+                        <div class="empty-mark" aria-hidden="true">λ</div>
+                        <h2 id="empty-title">New conversation</h2>
+                        <button
+                            id="empty-load"
+                            class="primary-button"
+                            type="button"
+                            hidden
+                        >
+                            Select a model
+                        </button>
+                        <div id="starters" class="starter-grid">
+                            <button
+                                class="starter"
+                                type="button"
+                                data-prompt="Help me implement the following.\n\n"
+                            >
+                                <span aria-hidden="true">＋</span>Build
+                            </button>
+                            <button
+                                class="starter"
+                                type="button"
+                                data-prompt="Review this code for correctness, edge cases, and security.\n\n"
+                            >
+                                <span aria-hidden="true">⌕</span>Review
+                            </button>
+                            <button
+                                class="starter"
+                                type="button"
+                                data-prompt="Explain how this code works.\n\n"
+                            >
+                                <span aria-hidden="true">≋</span>Explain
+                            </button>
+                        </div>
+                    </div>
+                    <div id="messages" class="messages"></div>
+                </section>
+                <div class="composer-region">
+                    <button
+                        id="jump-bottom"
+                        class="jump-bottom quiet-button"
+                        type="button"
+                        hidden
+                    >
+                        ↓ Latest messages
+                    </button>
+                    <div
+                        id="request-error"
+                        class="error-panel"
+                        role="alert"
+                        hidden
+                    >
+                        <div>
+                            <strong id="error-title">Request failed</strong>
+                            <p id="error-detail"></p>
+                        </div>
+                        <button
+                            id="retry-send"
+                            class="quiet-button"
+                            type="button"
+                        >
+                            Retry
+                        </button>
+                    </div>
+                    <div id="branch-notice" class="branch-notice" hidden></div>
+                    <form id="composer" class="composer">
+                        <label class="sr-only" for="prompt">Your message</label>
+                        <div
+                            id="attachments"
+                            class="attachments"
+                            aria-label="Attached images"
+                        ></div>
+                        <textarea
+                            id="prompt"
+                            rows="3"
+                            placeholder="Message…"
+                            spellcheck="false"
+                            aria-describedby="composer-hint"
+                        ></textarea>
+                        <div class="composer-toolbar">
+                            <div class="composer-tools">
+                                <button
+                                    id="attach-button"
+                                    class="icon-button"
+                                    type="button"
+                                    aria-label="Attach images"
+                                >
+                                    Attach images
+                                </button>
+                                <input
+                                    id="image-input"
+                                    type="file"
+                                    accept="image/png,image/jpeg"
+                                    multiple
+                                    hidden
+                                />
+                                <button
+                                    id="composer-settings"
+                                    class="quiet-button composer-settings"
+                                    type="button"
+                                    aria-label="Generation settings"
+                                >
+                                    Chat <span aria-hidden="true">⌄</span>
+                                </button>
+                                <span
+                                    id="attachment-status"
+                                    class="muted"
+                                    role="status"
+                                ></span>
+                            </div>
+                            <div class="send-tools">
+                                <span id="request-progress" role="status" hidden
+                                    ><span
+                                        class="spinner"
+                                        aria-hidden="true"
+                                    ></span
+                                    ><span class="sr-only">Generating…</span
+                                    ><span id="elapsed" aria-hidden="true"
+                                        >0.0s</span
+                                    ></span
+                                >
+                                <button
+                                    id="stop"
+                                    class="stop-button icon-button"
+                                    type="button"
+                                    aria-label="Stop generation"
+                                    hidden
+                                >
+                                    Stop
+                                </button>
+                                <button
+                                    id="send"
+                                    class="primary-button icon-button"
+                                    type="submit"
+                                    aria-label="Send message"
+                                >
+                                    Send
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+                    <div class="composer-meta">
+                        <span id="composer-hint" title="Send message"
+                            ><kbd id="send-shortcut">Ctrl Enter</kbd></span
+                        >
+                    </div>
+                </div>
+            </main>
+        </div>
+        <dialog
+            id="model-dialog"
+            class="model-dialog"
+            aria-labelledby="model-title"
+        >
+            <div class="dialog-header">
+                <h2 id="model-title">Model</h2>
+                <button
+                    id="close-model"
+                    class="icon-button"
+                    type="button"
+                    aria-label="Close model picker"
+                >
+                    Close
+                </button>
+            </div>
+            <div id="loaded-model" class="loaded-model" hidden>
+                <div>
+                    <span class="eyebrow">Loaded</span
+                    ><strong id="loaded-model-name"></strong
+                    ><span id="runtime-info" class="muted"></span>
+                </div>
+                <button id="unload-model" class="quiet-button" type="button">
+                    Unload
+                </button>
+            </div>
+            <div class="model-search-bar">
+                <label class="sr-only" for="model-search"
+                    >Search installed models</label
+                >
+                <input
+                    id="model-search"
+                    type="search"
+                    placeholder="Search models…"
+                    autocomplete="off"
+                />
+                <button id="rescan-models" class="quiet-button" type="button">
+                    Rescan
+                </button>
+            </div>
+            <p id="discovery-status" class="field-help" role="status"></p>
+            <div
+                id="installed-models"
+                class="installed-models"
+                aria-label="Installed models"
+            ></div>
+            <p
+                id="discovery-warnings"
+                class="field-help"
+                role="status"
+                hidden
+            ></p>
+            <form id="model-form">
+                <p id="selected-model" class="selected-model" role="status">
+                    No model selected
+                </p>
+                <div class="settings-grid">
+                    <div>
+                        <label for="model-gpu">GPU layers</label
+                        ><input
+                            id="model-gpu"
+                            type="text"
+                            value="auto"
+                            placeholder="auto / cpu / all / N"
+                            aria-describedby="gpu-hint"
+                            required
+                        /><span id="gpu-hint" class="field-help"
+                            >auto · cpu · all · layer count</span
+                        >
+                    </div>
+                    <div>
+                        <label for="model-context">Context tokens</label
+                        ><input
+                            id="model-context"
+                            type="number"
+                            value="4096"
+                            min="1"
+                            max="4294967295"
+                            step="1"
+                            required
+                        />
+                    </div>
+                </div>
+                <details id="model-advanced" class="model-advanced">
+                    <summary>Advanced · manual entry</summary>
+                    <label for="model-source">Source</label>
+                    <select id="model-source">
+                        <option value="local">Local file</option>
+                        <option value="ollama">Ollama</option>
+                    </select>
+                    <label id="model-path-label" for="model-path"
+                        >Model path</label
+                    >
+                    <input
+                        id="model-path"
+                        type="text"
+                        placeholder="/path/to/model.gguf"
+                        autocomplete="off"
+                        spellcheck="false"
+                    />
+                    <div id="ollama-dir-field" hidden>
+                        <label for="ollama-dir">Ollama directory</label
+                        ><input
+                            id="ollama-dir"
+                            type="text"
+                            placeholder="Default"
+                            autocomplete="off"
+                            spellcheck="false"
+                        />
+                    </div>
+                    <label for="model-projector">Vision projector path</label
+                    ><input
+                        id="model-projector"
+                        type="text"
+                        placeholder="Optional"
+                        autocomplete="off"
+                        spellcheck="false"
+                    />
+                </details>
+                <p id="model-error" class="form-error" role="alert" hidden></p>
+                <div class="dialog-footer">
+                    <span id="model-progress" class="muted" role="status"></span
+                    ><button
+                        id="load-model"
+                        class="primary-button"
+                        type="submit"
+                    >
+                        Load model
+                    </button>
+                </div>
+            </form>
+        </dialog>
+        <dialog
+            id="settings-dialog"
+            class="settings-dialog"
+            aria-labelledby="settings-title"
+        >
+            <div class="dialog-header">
+                <h2 id="settings-title">Settings</h2>
+                <button
+                    id="close-settings"
+                    class="icon-button"
+                    type="button"
+                    aria-label="Close settings"
+                >
+                    Close
+                </button>
+            </div>
+            <form id="settings-form">
+                <section id="web-settings" class="settings-section">
+                    <h3>Connection</h3>
+                    <label for="api-key"
+                        >API key <span class="muted">optional</span></label
+                    ><input
+                        id="api-key"
+                        type="password"
+                        autocomplete="off"
+                        autocapitalize="off"
+                        spellcheck="false"
+                        placeholder="API key"
+                    />
+                    <button id="connect" class="quiet-button" type="button">
+                        Connect
+                    </button>
+                    <p
+                        id="settings-connection"
+                        class="field-help"
+                        role="status"
+                    ></p>
+                </section>
+                <section class="settings-section">
+                    <h3>Conversation</h3>
+                    <label for="input-mode">Request mode</label
+                    ><select id="input-mode">
+                        <option value="chat">Chat</option>
+                        <option value="raw">Raw completion</option>
+                    </select>
+                    <label class="checkbox-label" for="coding-mode"
+                        ><input id="coding-mode" type="checkbox" /> Coding
+                        preset</label
+                    >
+                    <label for="system-prompt">System prompt</label
+                    ><textarea
+                        id="system-prompt"
+                        rows="4"
+                        placeholder="Optional instructions…"
+                    ></textarea>
+                </section>
+                <section class="settings-section">
+                    <h3>Generation</h3>
+                    <div class="settings-grid">
+                        <div>
+                            <label for="max-tokens">Max output tokens</label
+                            ><input
+                                id="max-tokens"
+                                type="number"
+                                min="1"
+                                max="4294967295"
+                                step="1"
+                                value="128"
+                                required
+                            />
+                        </div>
+                        <div>
+                            <label for="temperature">Temperature</label
+                            ><input
+                                id="temperature"
+                                type="number"
+                                min="0"
+                                max="2"
+                                step="any"
+                                value="0.8"
+                                required
+                            />
+                        </div>
+                        <div>
+                            <label for="top-p">Top P</label
+                            ><input
+                                id="top-p"
+                                type="number"
+                                min="0"
+                                max="1"
+                                step="any"
+                                value="0.95"
+                                required
+                            />
+                        </div>
+                        <div>
+                            <label for="seed"
+                                >Seed <span class="muted">optional</span></label
+                            ><input
+                                id="seed"
+                                type="number"
+                                min="0"
+                                max="4294967295"
+                                step="1"
+                                placeholder="Random"
+                            />
+                        </div>
+                    </div>
+                </section>
+                <section id="app-settings" class="settings-section" hidden>
+                    <div class="section-heading">
+                        <h3>Application</h3>
+                        <button
+                            id="source-update"
+                            class="quiet-button"
+                            type="button"
+                        >
+                            Update from source
+                        </button>
+                    </div>
+                    <p id="update-message" class="field-help" role="status"></p>
+                    <p
+                        id="update-error"
+                        class="form-error"
+                        role="alert"
+                        hidden
+                    ></p>
+                    <details id="update-details" hidden>
+                        <summary>Update log</summary>
+                        <pre
+                            id="update-log"
+                            tabindex="0"
+                            aria-label="Update log"
+                        ></pre>
+                    </details>
+                </section>
+                <p
+                    id="settings-error"
+                    class="form-error"
+                    role="alert"
+                    hidden
+                ></p>
+                <div class="dialog-footer">
+                    <button class="primary-button" type="submit">Apply</button>
+                </div>
+            </form>
+        </dialog>
+        <dialog
+            id="export-dialog"
+            class="export-dialog"
+            aria-labelledby="export-title"
+        >
+            <div class="dialog-header">
+                <h2 id="export-title">Export conversation</h2>
+                <button
+                    id="close-export"
+                    class="icon-button"
+                    type="button"
+                    aria-label="Close export"
+                >
+                    Close
+                </button>
+            </div>
+            <div class="export-actions">
+                <button id="export-json" class="export-option" type="button">
+                    <strong>JSON</strong
+                    ><span>Messages, images &amp; settings</span></button
+                ><button
+                    id="export-markdown"
+                    class="export-option"
+                    type="button"
+                >
+                    <strong>Markdown</strong><span>Readable document</span>
+                </button>
+            </div>
+        </dialog>
+        <dialog
+            id="update-confirm-dialog"
+            aria-labelledby="update-confirm-title"
+            aria-describedby="update-confirm-detail"
+        >
+            <div class="dialog-header">
+                <h2 id="update-confirm-title">Update from source?</h2>
+            </div>
+            <p id="update-confirm-detail" class="field-help">
+                This unloads the model and builds the latest checkout. Restart
+                when complete.
+            </p>
+            <div class="dialog-footer">
+                <button
+                    id="cancel-source-update"
+                    class="quiet-button"
+                    type="button"
+                    autofocus
+                >
+                    Cancel
+                </button>
+                <button
+                    id="confirm-source-update"
+                    class="primary-button"
+                    type="button"
+                >
+                    Update from source
+                </button>
+            </div>
+        </dialog>
+        <div id="toast" class="toast" role="status" hidden></div>
+        <noscript
+            ><div class="noscript">
+                Enable JavaScript to use chat.
+            </div></noscript
+        >
+    </body>
+</html>

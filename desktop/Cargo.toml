@@ -1,0 +1,45 @@
+[package]
+name = "lma-desktop"
+version = "0.2.0"
+edition = "2024"
+description = "lma desktop model workspace"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+cuda = ["lma/cuda"]
+
+[dependencies]
+lma = { path = "..", default-features = false, features = [
+    "vision",
+    "image-gen",
+    "speech",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+lma = { path = "..", default-features = false, features = [
+    "vision",
+    "image-gen",
+    "speech",
+    "metal",
+] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+debug = 0
+incremental = false
+
+[patch.crates-io]
+llama-cpp-2 = { path = "../vendor/llama-cpp-2" }
+llama-cpp-sys-2 = { path = "../vendor/llama-cpp-sys-2" }

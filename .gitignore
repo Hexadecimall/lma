@@ -1,1 +1,8 @@
 /target
+/lma-build
+/lma-build.exe
+/desktop/target
+/desktop/gen
+/models/
+__pycache__/
+/lma-build
