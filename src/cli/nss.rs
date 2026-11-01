@@ -35,11 +35,11 @@ pub(super) fn parse(mut args: Args) -> Result<Action, String> {
                 _ => {}
             }
         }
-        return Err("use `lma nss [--dry-run] serve|stop|launch|list|chat|transcribe|help|quantize|fetch|import|create|delete|image ...` or `lma h nss`; root short commands are disabled in nss (except the legacy lh alias)".into());
+        return Err("use `lma nss [--dry-run] serve|stop|launch|list|chat|transcribe|help|quantize|fetch|import|create|delete|update|image ...` or `lma h nss`; root short commands are disabled in nss (except the legacy lh alias)".into());
     }
     if dry_run {
         Err(
-            "nss needs a command: serve, stop, launch, list, chat, transcribe, help, quantize, fetch, import, create, delete, or image"
+            "nss needs a command: serve, stop, launch, list, chat, transcribe, help, quantize, fetch, import, create, delete, update, or image"
                 .into(),
         )
     } else {

@@ -1,0 +1,342 @@
+name: Publish CLI release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable tag to release (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize push/dispatch attempts for the same tag without cancelling uploads.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate existing tag, version, and notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.tag.outputs.sha }}
+    steps:
+      - name: Resolve tag and reject existing releases
+        id: tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.eventName === 'workflow_dispatch'
+              ? context.payload.inputs.tag
+              : context.ref.replace(/^refs\/tags\//, '');
+            if (!/^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(tag)
+                || tag.trim() !== tag) {
+              throw new Error('Expected a strict stable tag vMAJOR.MINOR.PATCH (no leading zeroes).');
+            }
+            const repo = context.repo;
+            let { data: { object } } = await github.rest.git.getRef({ ...repo, ref: 'tags/' + tag });
+            for (let depth = 0; object.type === 'tag' && depth < 10; depth++) {
+              ({ data: { object } } = await github.rest.git.getTag({ ...repo, tag_sha: object.sha }));
+            }
+            if (object.type !== 'commit') throw new Error('Tag must resolve to a commit.');
+            const releases = await github.paginate(github.rest.repos.listReleases, { ...repo, per_page: 100 });
+            if (releases.some(release => release.tag_name === tag)) {
+              throw new Error('A release/draft already exists for ' + tag + '; refusing to overwrite it.');
+            }
+            core.setOutput('tag', tag);
+            core.setOutput('sha', object.sha);
+      - uses: actions/checkout@v4
+        with:
+          # Pin every job to the resolved tag commit, including manual dispatch.
+          ref: ${{ steps.tag.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check tagged Cargo version and nonempty licenses before any builds
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          package = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']
+          expected = os.environ['RELEASE_TAG'][1:]
+          if package['name'] != 'lma' or package['version'] != expected:
+              raise SystemExit(f"Tag requires lma {expected}; Cargo.toml declares {package['name']} {package['version']}")
+          for name in ('LICENSE', 'vendor/llama-cpp-sys-2/llama.cpp/LICENSE'):
+              path = pathlib.Path(name)
+              if not path.is_file() or not path.read_bytes().strip():
+                  raise SystemExit(f'{name} is missing or empty; the owner must supply it before publishing.')
+          PY
+
+  build:
+    name: Build ${{ matrix.target }} (${{ matrix.backend }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub documents macos-15 as Apple Silicon, not Intel.
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            backend: metal
+            features: vision,image-gen,speech,metal
+            extension: ""
+            rustflags: ""
+            static-crt: "0"
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            backend: cpu
+            features: vision,image-gen,speech
+            extension: ""
+            rustflags: ""
+            static-crt: "0"
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            backend: cpu
+            features: vision,image-gen,speech
+            extension: .exe
+            rustflags: -C target-feature=+crt-static
+            static-crt: "1"
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      CMAKE_BUILD_TYPE: Release
+      LLAMA_LIB_PROFILE: Release
+      LLAMA_BUILD_SHARED_LIBS: "0"
+      LLAMA_STATIC_CRT: ${{ matrix.static-crt }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      # No runner-native CPU tuning or implicit AVX baseline for distribution.
+      GGML_NATIVE: "OFF"
+      GGML_SSE42: "OFF"
+      GGML_AVX: "OFF"
+      GGML_AVX2: "OFF"
+      GGML_BMI2: "OFF"
+      GGML_FMA: "OFF"
+      GGML_F16C: "OFF"
+      GGML_METAL_EMBED_LIBRARY: "ON"
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_TARGET: ${{ matrix.target }}
+      RELEASE_BACKEND: ${{ matrix.backend }}
+      RELEASE_EXTENSION: ${{ matrix.extension }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - name: Install Linux compiler, CMake, and libclang
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential cmake ninja-build pkg-config clang libclang-dev
+          cmake --version
+          clang --version
+      - name: Prepare macOS libclang and Xcode Metal compiler
+        if: runner.os == 'macOS'
+        run: |
+          brew list --versions llvm >/dev/null || brew install llvm
+          brew list --versions cmake >/dev/null || brew install cmake
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          xcode-select --print-path
+          xcrun clang --version
+          if ! xcrun metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+          cmake --version
+      - name: Set up Windows x64 MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Locate Windows LLVM, libclang, and CMake
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $clang = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path "$clang\libclang.dll")) {
+            throw 'The Windows runner must provide LLVM/libclang for bindgen.'
+          }
+          "LIBCLANG_PATH=$clang" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $clang | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$clang\clang.exe" --version
+          cmake --version
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            throw 'The x64 MSVC compiler environment is required.'
+          }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Assert native Rust host matches the asset target
+        run: |
+          rustc --version --verbose
+          host="$(rustc --version --verbose | sed -n 's/^host: //p' | tr -d '\r')"
+          if [ "$host" != "$RELEASE_TARGET" ]; then
+            echo "Refusing mislabeled asset: rustc host $host != $RELEASE_TARGET" >&2
+            exit 1
+          fi
+      - name: Build only the standalone CLI
+        env:
+          RELEASE_FEATURES: ${{ matrix.features }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ runner.os == 'macOS' && '15.0' || '' }}
+        run: |
+          cargo build --locked --release --jobs 2 --bin lma \
+            --no-default-features --features "$RELEASE_FEATURES" --target "$RELEASE_TARGET"
+      - name: Stage raw executable and ad-hoc sign macOS before hashing
+        run: |
+          mkdir -p release-assets
+          asset="release-assets/lma-${RELEASE_TAG}-${RELEASE_TARGET}-${RELEASE_BACKEND}${RELEASE_EXTENSION}"
+          cp "$CARGO_TARGET_DIR/$RELEASE_TARGET/release/lma$RELEASE_EXTENSION" "$asset"
+          chmod +x "$asset"
+          if [ "$RUNNER_OS" = macOS ]; then
+            codesign --force --sign - "$asset"
+            codesign --verify --strict --verbose=2 "$asset"
+          fi
+          # Also catches missing runtime libraries on the native build runner.
+          "$asset" -v
+      - name: Upload the raw binary for the aggregation job
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.target }}
+          path: release-assets/lma-${{ needs.validate.outputs.tag }}-${{ matrix.target }}-${{ matrix.backend }}${{ matrix.extension }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          overwrite: false
+
+  publish:
+    name: Aggregate, upload draft, then publish complete release
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-binary-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify assets, create draft, upload everything, and publish
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const crypto = require('node:crypto');
+            const repo = context.repo;
+            const tag = process.env.RELEASE_TAG;
+            const directory = 'release-assets';
+            const binaries = [
+              'lma-' + tag + '-aarch64-apple-darwin-metal',
+              'lma-' + tag + '-x86_64-unknown-linux-gnu-cpu',
+              'lma-' + tag + '-x86_64-pc-windows-msvc-cpu.exe',
+            ];
+            const sameNames = (actual, expected) =>
+              JSON.stringify([...actual].sort()) === JSON.stringify([...expected].sort());
+            if (!sameNames(fs.readdirSync(directory), binaries)) {
+              throw new Error('Expected exactly the three native binary assets; no partial releases.');
+            }
+            for (const name of binaries) {
+              const stat = fs.lstatSync(path.join(directory, name));
+              if (!stat.isFile() || stat.size === 0) throw new Error('Missing/empty binary: ' + name);
+            }
+            const notices = [
+              ['LICENSE', 'LICENSE'],
+              ['vendor/llama-cpp-sys-2/llama.cpp/LICENSE', 'LICENSE-llama.cpp'],
+            ];
+            for (const [source, name] of notices) {
+              const data = fs.readFileSync(source);
+              if (!data.toString('utf8').trim()) throw new Error(source + ' must not be empty.');
+              fs.writeFileSync(path.join(directory, name), data);
+            }
+            const names = [...binaries, ...notices.map(([, name]) => name)].sort();
+            const hashes = new Map(names.map(name => [name,
+              crypto.createHash('sha256').update(fs.readFileSync(path.join(directory, name))).digest('hex')]));
+            // sha256sum text format: lowercase hash, two spaces, exact filename, LF.
+            fs.writeFileSync(path.join(directory, 'SHA256SUMS'),
+              names.map(name => hashes.get(name) + '  ' + name + '\n').join(''));
+            names.push('SHA256SUMS');
+
+            // Recheck with the write-authorized token: include drafts and guard tag movement.
+            let { data: { object } } = await github.rest.git.getRef({ ...repo, ref: 'tags/' + tag });
+            for (let depth = 0; object.type === 'tag' && depth < 10; depth++) {
+              ({ data: { object } } = await github.rest.git.getTag({ ...repo, tag_sha: object.sha }));
+            }
+            if (object.type !== 'commit' || object.sha !== process.env.RELEASE_SHA) {
+              throw new Error('The existing tag moved or no longer resolves to the validated commit.');
+            }
+            const existing = await github.paginate(github.rest.repos.listReleases, { ...repo, per_page: 100 });
+            if (existing.some(release => release.tag_name === tag)) {
+              throw new Error('A release/draft already exists for ' + tag + '; refusing to overwrite it.');
+            }
+            const { data: release } = await github.rest.repos.createRelease({
+              ...repo,
+              tag_name: tag,
+              target_commitish: process.env.RELEASE_SHA,
+              name: 'lma ' + tag,
+              draft: true,
+              prerelease: false,
+              body: 'Standalone CLI: Apple Silicon Metal, Linux x86_64 CPU (Ubuntu 24.04/glibc 2.39 baseline), '
+                + 'and Windows x64 MSVC CPU. All include vision, image generation, and speech. '
+                + 'macOS is ad-hoc signed, not Developer ID signed or notarized. '
+                + 'SHA256SUMS covers the binaries and license notices; it is not an independent signature.',
+            });
+            // Failures intentionally leave a draft for owner inspection; never delete/overwrite it.
+            for (const name of names) {
+              const data = fs.readFileSync(path.join(directory, name));
+              await github.rest.repos.uploadReleaseAsset({
+                ...repo,
+                release_id: release.id,
+                url: release.upload_url,
+                name,
+                headers: {
+                  'content-type': binaries.includes(name) ? 'application/octet-stream' : 'text/plain',
+                  'content-length': data.length,
+                },
+                data,
+              });
+            }
+            const uploaded = await github.paginate(github.rest.repos.listReleaseAssets, {
+              ...repo, release_id: release.id, per_page: 100,
+            });
+            if (!sameNames(uploaded.map(asset => asset.name), names)) {
+              throw new Error('Uploaded asset set is incomplete or unexpected; leaving draft unpublished.');
+            }
+            for (const asset of uploaded) {
+              const size = fs.statSync(path.join(directory, asset.name)).size;
+              if (asset.state !== 'uploaded' || asset.size !== size) {
+                throw new Error('Upload verification failed for ' + asset.name + '; leaving draft unpublished.');
+              }
+              if (hashes.has(asset.name) && asset.digest
+                  && asset.digest !== 'sha256:' + hashes.get(asset.name)) {
+                throw new Error('Server checksum mismatch for ' + asset.name + '; leaving draft unpublished.');
+              }
+            }
+            await github.rest.repos.updateRelease({
+              ...repo, release_id: release.id, draft: false, prerelease: false, make_latest: 'true',
+            });
+            core.notice('Published complete release ' + tag + ': ' + release.html_url);

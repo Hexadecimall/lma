@@ -284,6 +284,7 @@ impl App {
                 return Err("Raw mode cannot send attachments; use /chat or /new".into());
             }
             body["prompt"] = json!(self.editor.text);
+            body["stream_options"] = json!({"include_usage": true});
             ("/v1/completions", 1024 * 1024)
         } else {
             let mut messages = Vec::new();
@@ -458,7 +459,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["prompt"], "abc");
         assert_eq!(value["stream"], true);
-        assert!(value.get("stream_options").is_none());
+        assert_eq!(value["stream_options"]["include_usage"], true);
         assert!(value.get("messages").is_none());
         command(&mut a, "/run touch /tmp/nope");
         assert!(a.notice.contains("Unknown command"));

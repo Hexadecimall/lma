@@ -1836,6 +1836,69 @@ fn fetch_dry_run_defaults_to_combined_catalogs_without_network_or_files() {
 }
 
 #[test]
+fn release_updater_is_short_at_root_and_dry_run_is_completely_local() {
+    let temp = TempDir::new();
+    for argv in [
+        vec!["u", "-c", "-v", "0.4.0", "-d"],
+        vec![
+            "nss",
+            "update",
+            "--check",
+            "--version",
+            "v0.4.0",
+            "--dry-run",
+        ],
+    ] {
+        let output = isolated_lma(&temp)
+            .env_clear()
+            .env("PATH", "")
+            .env("HOME", &temp.0)
+            .env("GH_TOKEN", "not-a-real-secret")
+            .args(argv)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let plan: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(
+            plan,
+            serde_json::json!({"command":"update","dry_run":true,"options":{"check":true,"version":"v0.4.0"}})
+        );
+        assert!(!stdout(&output).contains("not-a-real-secret"));
+        assert!(stderr(&output).is_empty());
+        assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 0);
+    }
+    for argv in [
+        vec!["h", "u"],
+        vec!["nss", "help", "update"],
+        vec!["u", "-h"],
+    ] {
+        let output = isolated_lma(&temp)
+            .env_clear()
+            .env("PATH", "")
+            .args(argv)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(stdout(&output).contains("SHA256SUMS"));
+    }
+    for argv in [
+        vec!["update"],
+        vec!["u", "--check"],
+        vec!["u", "-v", "../bad"],
+        vec!["nss", "u"],
+    ] {
+        assert!(
+            !isolated_lma(&temp)
+                .args(argv)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
 fn fetch_popular_listing_and_index_are_network_free_in_dry_run() {
     let temp = TempDir::new();
     for (argv, expected) in [

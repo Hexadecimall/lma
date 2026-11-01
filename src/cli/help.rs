@@ -38,6 +38,7 @@ pub(super) fn parse(mut args: Args, syntax: Syntax) -> Result<Action, String> {
                 Command::Create => CREATE,
                 Command::Delete => super::delete::HELP,
                 Command::Transcribe => super::transcribe::HELP,
+                Command::Update => UPDATE,
             }));
         }
         Some("advanced") if syntax == Syntax::Nss => {
@@ -54,6 +55,7 @@ pub(super) fn parse(mut args: Args, syntax: Syntax) -> Result<Action, String> {
                 Command::Create => CREATE,
                 Command::Delete => super::delete::HELP,
                 Command::Transcribe => super::transcribe::HELP,
+                Command::Update => UPDATE,
             }));
         }
         _ => {
@@ -73,6 +75,7 @@ pub(super) fn parse(mut args: Args, syntax: Syntax) -> Result<Action, String> {
         Command::Create => CREATE,
         Command::Delete => super::delete::HELP,
         Command::Transcribe => super::transcribe::HELP,
+        Command::Update => UPDATE,
     }))
 }
 
@@ -99,6 +102,7 @@ COMMANDS
 ├─ it                    Import supported safetensors / nss import
 ├─ ce NAME               Create a Modelfile profile / nss create NAME
 ├─ d NAME                Delete an installed model / nss delete NAME
+├─ u [-c]                Update CLI from releases / nss update
 └─ nss COMMAND           Long commands, long flags, and legacy aliases
 
 EXAMPLES
@@ -124,6 +128,29 @@ Downloads are explicit: `f`, API pull, or inspected desktop model installation.
 Color is terminal-only; NO_COLOR (nonempty) or TERM=dumb disables it. JSON stays plain.
 "
 );
+
+pub(super) const UPDATE: &str = "\
+lma u — update the installed CLI from official GitHub releases.
+
+USAGE
+  lma u                 Check latest stable release and install if newer
+  lma u -c              Check only: metadata access, no executable download/writes
+  lma u -v 0.3.4        Select an explicit stable release; no downgrades
+  lma u -d              Network-free configuration preview
+  lma nss update [--check] [--version VERSION] [--dry-run]
+
+Only Hexadecimall/lma GitHub releases are used. Exact OS/architecture/backend
+assets and SHA256SUMS are required; no CPU downgrade, source builds, model
+downloads, server restarts, or privilege elevation. Windows stages a verified
+file with post-exit manual replacement instructions, not a claimed live update.
+Package-manager, desktop and target/debug|release executables must use their
+installer. Legitimate CLI symlinks resolve to the real installed executable.
+State/backups use ~/.lma/updates; Unix publication uses an atomic sibling file.
+Private repositories need GH_TOKEN or GITHUB_TOKEN with repository access;
+keys are never printed or saved. Checksums are not an independent signature.
+An unpublished release or missing matching asset is an error, not a build fallback.
+See docs/updating.md and docs/publishing-releases.md.
+";
 
 pub(super) const CREATE: &str = r#"lma ce — register a named local Modelfile definition.
 
@@ -682,7 +709,7 @@ lma nss — no short syntax.
 
 Use the SAME embedded engine with long command names and flags.
 Use serve/server, stop, launch/lh, list, chat, transcribe, help,
-quantize/quant, fetch, import, create, delete, or image/imagen/image-gen/img.
+quantize/quant, fetch, import, create, delete, update, or image/imagen/image-gen/img.
 All legacy long aliases live HERE, not at root.
 Root commands/flags use first letters, then first + last on collisions.
 Root t pairs with nss transcribe; s serves and sp stops.
@@ -808,6 +835,17 @@ OPTIONAL COMPLETIONS / CHAT COMPLETIONS FIELDS
   top_p         Greater than 0, at most 1 (default: 0.95)
   seed          Unsigned 32-bit seed (optional)
   stream        Chat and raw completions support native SSE (default: false)
+  stop          String or up to four strings; native early stop, stripped from output
+  frequency_penalty / presence_penalty   -2..2, generated history only
+  logit_bias    Map of loaded-model token IDs to -100..100 bias values
+  n             1 only; neutral logprobs:null (Chat also false) accepted
+  stream_options.include_usage   Optional separate SSE usage record
+  Raw completions: echo, best_of:1, prompt:string or one-element string array.
+  Chat: response_format text/json_object/json_schema; Responses: text.format.
+  JSON uses bounded native grammar/schema validation, not an ignored hint.
+  One successor can wait 1.5s after disconnect for worker cleanup; no overlap.
+  Token logprobs, n>1, generic suffix infill and cloud services remain unsupported.
+  Full field/combination limits: docs/openai-api.md.
 
 IMAGES
   Requires a vision build (default) and compatible GGUF model + projector.
@@ -917,6 +955,8 @@ SOURCES
   Without a query, -l lists popular public Hugging Face GGUF repositories by
   reported downloads (default 50). This is not a merged Ollama/HF ranking.
   -oe      Only Ollama's registry (exact model[:tag] lookup)
+  With -l, owner/name is a search (owner plus name prefix), not an exact lookup.
+  Downloading still requires an exact full owner/repository; no fuzzy downloads.
   -le   Only public Hugging Face GGUF repositories,
                         the source used by LM Studio's downloader
   Both flags: combine both sources. Model weights are never merged.

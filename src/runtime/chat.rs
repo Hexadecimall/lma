@@ -15,6 +15,10 @@ pub(super) fn profile_prompt(prompt: Prompt, definition: Option<&Definition>) ->
             Prompt::RequestSystem { prompt, explicit } => {
                 apply(*prompt, definition, Some(explicit))
             }
+            Prompt::Controls { prompt, controls } => Prompt::Controls {
+                prompt: Box::new(apply(*prompt, definition, explicit)),
+                controls,
+            },
             Prompt::Constrained { prompt, schema } => Prompt::Constrained {
                 prompt: Box::new(apply(*prompt, definition, explicit)),
                 schema,

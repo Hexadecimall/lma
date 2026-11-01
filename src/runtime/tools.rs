@@ -723,6 +723,17 @@ pub(super) fn arguments(value: &Value) -> Result<Value, ApiError> {
         .map_err(|_| invalid("function arguments must be a complete JSON object string"))
 }
 
+pub(super) fn validate_output_schema(schema: &Value) -> Result<(), ApiError> {
+    validate_schema(schema, 0, &mut 0)?;
+    llama_cpp_2::json_schema_to_grammar(&schema.to_string())
+        .map_err(|_| invalid("JSON schema cannot be represented by the native grammar"))?;
+    Ok(())
+}
+
+pub(super) fn output_matches(schema: &Value, value: &Value) -> bool {
+    matches_schema(schema, value)
+}
+
 fn validate_schema(schema: &Value, depth: usize, nodes: &mut usize) -> Result<(), ApiError> {
     *nodes += 1;
     if depth > 8 || *nodes > 256 {

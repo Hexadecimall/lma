@@ -5,6 +5,7 @@ mod create;
 mod delete;
 mod embeddings;
 mod expert_history;
+mod generation_controls;
 mod hosting;
 mod imagegen;
 mod inference;
@@ -13,6 +14,7 @@ mod list;
 mod llama_api;
 mod native_api;
 mod ollama;
+mod openai;
 pub mod quantize;
 pub mod server;
 // Candidate-history prototype only; verified batched decoding is not integrated.
@@ -82,6 +84,7 @@ pub fn run(mut plan: Plan) -> Result<(), String> {
         Job::Import(config) => crate::import::run(config),
         Job::Create(config) => create::run(config, false),
         Job::Delete(config) => delete::run(config),
+        Job::Update(config) => crate::update::run(config),
         Job::Transcribe(config) => {
             let transcript = crate::speech::transcribe(config.options())?;
             if config.json {

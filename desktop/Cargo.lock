@@ -2836,7 +2836,7 @@ dependencies = [
 
 [[package]]
 name = "lma"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "lma-desktop"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "lma",

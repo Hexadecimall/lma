@@ -102,12 +102,27 @@ lma i models/sd15 "a watercolor fox" -o fox.png # Requires local SD1.5 assets
 | `lma sp`     | `lma nss stop`       | Stop/unload on the local managed host |
 | `lma q`      | `lma nss quantize`   | Quantize a local GGUF                 |
 | `lma f`      | `lma nss fetch`      | Explicit model downloads              |
+| `lma u`      | `lma nss update`     | Update standalone CLI from releases   |
 | `lma i`      | `lma nss image`      | Local SD1.5 image generation          |
 | `lma it`     | `lma nss import`     | Convert supported local safetensors   |
 
 Root commands and flags have **one canonical spelling**: the first letter, or first + last letter to resolve a collision (`lh`, `ce`, `sp`, `it`). There are no long command aliases or long flags at root. Use `lma -h` / `lma -v` for help/version, not `--help`, `--version`, or `-V`. Command flags reserve `-h` for help and `-d` for dry-run. Detailed help uses `lma h s -a` or `lma nss help serve advanced`.
 
 Long commands, long flags, and legacy aliases are **NSS-only**, for example `lma nss server`, `lma nss quant`, `lma nss imagen`, and `lma nss img`. Bare `--` at root is an error, not an escape into NSS; start with `lma nss COMMAND` explicitly. Multi-letter root flags are exact names, not bundles; see the command tables below. Cargo, Python, installer, and build-helper flags are separate and unchanged.
+
+### Release updates
+
+`lma u -c` checks official GitHub Releases; `lma u` installs a newer matching
+standalone CLI after size/SHA-256 verification. `lma u -v VERSION` selects a stable
+release without allowing downgrades; `-d` is a completely local preview. Long
+syntax is `lma nss update --check` / `--version VERSION`. It does not build source,
+restart servers, update desktop, or silently replace GPU builds with CPU builds.
+Windows stages verified bytes for manual post-exit replacement. Private release
+access needs `GH_TOKEN` or `GITHUB_TOKEN`; no token is printed/saved. There are no
+published releases yet, and publishing is blocked until the owner supplies the
+currently empty project `LICENSE`. See [updating](docs/updating.md) and
+[publishing releases](docs/publishing-releases.md). Existing source-build updates
+remain separate.
 
 ### Stop or unload
 
@@ -461,11 +476,11 @@ Raw Completions and Chat Completions share these options. Sampling/output defaul
 | `seed`        | Optional unsigned 32-bit integer.                                      |
 | `stream`      | Default false; true enables native SSE for Chat and raw Completions.   |
 
-These endpoints return `choices`, `usage`, and `finish_reason`. Chat also accepts `tools`, `tool_choice`, `parallel_tool_calls`, assistant `tool_calls`, matched `role:tool` results, and `stream_options.include_usage`. `max_completion_tokens` is an alternative to `max_tokens`, not an additional budget. Unsupported fields such as stop sequences and penalties are rejected. Prompt tokens (including injected tool definitions and chat/image formatting) plus the **requested** output limit must fit the configured context.
+These endpoints return `choices`, `usage`, and `finish_reason`. Chat also accepts `tools`, `tool_choice`, `parallel_tool_calls`, assistant `tool_calls`, matched `role:tool` results, and `stream_options.include_usage`. `max_completion_tokens` is an alternative to `max_tokens`, not an additional budget. Native `stop`, frequency/presence penalties and `logit_bias` are now supported, not stripped by client shims. Chat `response_format` and Responses `text.format` support bounded native JSON-object/schema constraints. Completions also supports prompt echo, one-element string-array prompts, `n:1`, `best_of:1`, neutral `logprobs:null` and optional streamed usage. Multiple candidates, token log probabilities, generic suffix infill and all OpenAI cloud services are **not** implemented; see the [exact OpenAI contract](docs/openai-api.md). Prompt tokens (including injected tool definitions and chat/image formatting) plus the **requested** output limit must fit the configured context.
 
 Messages uses `tool_use` / `tool_result` content blocks; Responses uses `function_call` / `function_call_output` items. Include full conversation history on every request: no server-side response storage or `previous_response_id`. The shared tool bridge constrains output with native JSON-schema grammar, validates calls/arguments against supplied definitions, and rejects truncated or invalid output without issuing a call. Limits include 32 tools, 8 calls/turn, and a bounded schema subset—not arbitrary JSON Schema. Tools are executed by clients only.
 
-Text SSE forwards actual native deltas. Raw Completions ends with a finish/usage chunk and `data: [DONE]`; Chat sends a separate usage chunk only with `stream_options.include_usage:true`. With tools enabled, lifecycle events start early, but the structured envelope (including any answer text) is buffered until validated; `x-lma-streaming` distinguishes `native` from `validated-tool-buffer`. Provider cache/reasoning/verbosity hints are advisory, not implemented provider services; accepted hints are disclosed through `x-lma-advisory`. See `lma nss help serve advanced` and [client documentation](docs/clients.md).
+Text SSE forwards actual native deltas. Raw Completions and Chat end with a finish chunk and `data: [DONE]`, and send a separate `choices:[]` usage chunk only with `stream_options.include_usage:true`. With tools enabled, lifecycle events start early, but the structured envelope (including any answer text) is buffered until validated; `x-lma-streaming` distinguishes `native` from `validated-tool-buffer`. Provider cache/reasoning/verbosity hints are advisory, not implemented provider services; accepted hints are disclosed through `x-lma-advisory`. See `lma nss help serve advanced` and [client documentation](docs/clients.md).
 
 ### Images and Ollama-compatible generation
 
@@ -486,7 +501,7 @@ For `/v1/chat/completions`, each user message may have string `content` plus `"i
 
 **Both Ollama generation routes default to `stream:true`**, returning newline-delimited JSON (`application/x-ndjson`), not SSE. Send explicit `stream:false` for one JSON response; this is required for clients relying on the older lma default. Records carry `model`, UTC `created_at`, `message` (chat) or `response` (generate), and `done`; the successful terminal record adds `done_reason`, real token counts, and measured `total_duration`. Unavailable phase timings are omitted. Ollama handler/auth errors use `{"error":"message"}`; errors after streaming headers arrive as NDJSON error records without a successful terminal record. There is no `[DONE]` sentinel.
 
-Supported `options` are `num_predict`, `temperature`, `top_p`, `seed`, and `num_ctx` only when equal to the hosted context. Sampling/output defaults match the `/v1` fields above unless supplied by the selected definition; explicit request options win. Non-raw requests also apply its default system prompt and initial messages; explicit system instructions override `SYSTEM`, and `system:""` clears it in `/api/generate`. The HTTP host accepts `keep_alive` seconds/duration strings, `0` for unloading after completion, or `-1` for indefinite residency. It switches installed models by request name; active response leases prevent unsafe unloads. In-process desktop/TUI sessions remain explicitly selected. JSON/schema `format`, separate thinking output/control, unknown fields, and other Ollama options are rejected rather than silently applied (`think:false` only requests no separate thinking channel). Tool output is constrained and buffered until validation. See **[the Ollama API contract](docs/ollama-api.md)** for wire examples, discovery omissions, lifecycle, tools, and errors. This is a compatibility subset, not a full Ollama daemon or universal dense/MoE model-support claim.
+Supported `options` are `num_predict` (positive or `-1` for remaining context), `temperature`, `top_p`, `seed`, and `num_ctx`; managed chat/generate requests can safely reload to a new context, while pinned sessions require a matching context. Sampling/output defaults match the `/v1` fields above unless supplied by the selected definition; explicit request options win. Non-raw requests also apply its default system prompt and initial messages; explicit system instructions override `SYSTEM`, and `system:""` clears it in `/api/generate`. The HTTP host accepts `keep_alive` seconds/duration strings, `0` for unloading after completion, or `-1` for indefinite residency. It switches installed models by request name; active response leases prevent unsafe unloads. In-process desktop/TUI sessions remain explicitly selected. JSON/schema `format`, separate thinking output/control, unknown fields, and other Ollama options are rejected rather than silently applied (`think:false` only requests no separate thinking channel). Tool output is constrained and buffered until validation. See **[the Ollama API contract](docs/ollama-api.md)** for wire examples, discovery omissions, lifecycle, tools, and errors. This is a compatibility subset, not a full Ollama daemon or universal dense/MoE model-support claim.
 
 With a compatible vision server running, encode a local file on the client and send it without a giant inline payload:
 
@@ -506,7 +521,7 @@ Limits per request: **8 images**, **8 MiB decoded per image**, **16 MiB decoded 
 
 Messages and Responses accept user PNG/JPEG base64/data-URL image inputs with the same image ordering and vision requirements, but have **1 MiB** bodies. Combining images with tool history has not been verified with a real model; token counting rejects images. No endpoint fetches remote image URLs.
 
-Only **one model operation runs at a time**; overlapping requests receive HTTP **429**. Disconnecting an SSE client cancels native generation, with bounded queues and admission retained until cleanup. Native embeddings share that worker through `/v1/embeddings`, `/api/embed`, and `/api/embeddings`; vectors are normalized and usage counts evaluated model tokens, not generated text. Automatic downloads during serving, LoRA adapters, parallel slots, hosted cloud tools, Responses WebSockets, compressed request bodies, and arbitrary upstream flags remain unsupported. GGUF downloads are explicit through `lma f` or `/api/pull`; image generation remains CLI-only. Performance depends on model, build, hardware, and settings; no benchmark claim is made.
+Only **one model operation runs at a time**; connected overlap receives HTTP **429**. After disconnect, one successor can wait up to **1.5 seconds** for native cleanup rather than immediately returning busy. Admission remains worker-owned until cleanup ends; extra waiters or longer cleanup still receive 429. Disconnecting an SSE client cancels native generation without introducing an unbounded queue. Native embeddings share that worker through `/v1/embeddings`, `/api/embed`, and `/api/embeddings`; vectors are normalized and usage counts evaluated model tokens, not generated text. Automatic downloads during serving, LoRA adapters, parallel slots, hosted cloud tools, Responses WebSockets, compressed request bodies, and arbitrary upstream flags remain unsupported. GGUF downloads are explicit through `lma f` or `/api/pull`; image generation remains CLI-only. Performance depends on model, build, hardware, and settings; no benchmark claim is made.
 
 ## Fetch GGUF models
 
@@ -541,7 +556,10 @@ ranked by Hugging Face's reported download counts; `-i NUM` changes the count.
 This is a repository ranking, not a ranking of individual quantizations, model
 quality, speed, or verified lma compatibility. Some catalog models may not be
 supported by the pinned runtime. Ollama counts are not mixed into this ranking;
-`-oe` alone needs a query. A query is always required to download. Listings use
+`-oe` alone needs a query. A query is always required to download. With `-l`, an `owner/prefix` such as
+`mradermacher/Mellum` searches that owner's public GGUF models rather than
+mistakenly looking up a nonexistent exact repository. Exact repository selection
+remains mandatory for downloads, with no fuzzy auto-download fallback. Listings use
 bounded catalog metadata and never download weights or create model directories.
 
 **Hugging Face support:** public compatible GGUF repositories can be downloaded
@@ -651,7 +669,7 @@ Existing output is refused unless `--force` is supplied. A temporary sibling fil
 
 ## No short syntax (`nss`)
 
-NSS is the **only namespace for long commands, long flags, and legacy aliases**. Root shortcuts `h`, `l`, `c`, `ce`, `d`, `t`, `s`, `sp`, `q`, `f`, `i`, and `it` are errors after `lma nss`. Use `help`, `list`, `launch` / `lh` (the legacy NSS exception), `chat`, `transcribe`, `serve` / `server`, `stop`, `quantize` / `quant`, `fetch`, `import`, `create`, `delete`, or `image` / `imagen` / `image-gen` / `img`. NSS retains legacy option shortcuts such as `-m`, `-c`, `-t`, `-q`, `-p`, `-o`, and `-h`, plus positional models and friendly options like `--gpu all`. Those shortcuts are not necessarily the root flag table: for example, quantization uses root `-t TYPE -ts THREADS`, versus NSS `-q TYPE -t THREADS`. Both namespaces use the same embedded engine and safety checks, not upstream passthrough.
+NSS is the **only namespace for long commands, long flags, and legacy aliases**. Root shortcuts `h`, `l`, `c`, `ce`, `d`, `t`, `s`, `sp`, `q`, `f`, `i`, `it`, and `u` are errors after `lma nss`. Use `help`, `list`, `launch` / `lh` (the legacy NSS exception), `chat`, `transcribe`, `serve` / `server`, `stop`, `quantize` / `quant`, `fetch`, `import`, `create`, `delete`, `update`, or `image` / `imagen` / `image-gen` / `img`. NSS retains legacy option shortcuts such as `-m`, `-c`, `-t`, `-q`, `-p`, `-o`, and `-h`, plus positional models and friendly options like `--gpu all`. Those shortcuts are not necessarily the root flag table: for example, quantization uses root `-t TYPE -ts THREADS`, versus NSS `-q TYPE -t THREADS`. Both namespaces use the same embedded engine and safety checks, not upstream passthrough.
 
 ```sh
 lma nss serve --path model.gguf -c 8k --gpu cpu

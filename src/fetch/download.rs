@@ -55,7 +55,7 @@ pub(super) fn checked_status(response: Response) -> Result<Response, String> {
         Ok(response)
     } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         Err(format!(
-            "HTTP {status}: private/gated models are unsupported; select a publicly downloadable repository (authentication is not sent)"
+            "HTTP {status}: repository may be private/gated or the exact name may not exist (Hugging Face can return 401 for missing repositories); check owner/repository, or use -l to search. Authentication is not sent"
         ))
     } else {
         Err(format!("HTTP {status}"))

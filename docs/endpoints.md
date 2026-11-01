@@ -2,6 +2,9 @@
 
 Profiles select HTTP contracts around the **same in-process inference engine**. They do not launch `llama-server`, an Ollama daemon, or cloud services, and make no performance claim. These are supported subsets, **not full llama-server, cloud-provider, or agent parity**. Selecting a profile does not add model capabilities.
 
+For native stop sequences, sampling controls, JSON output formats, Completions
+usage/echo and post-cancellation handoff, see the [OpenAI text API contract](openai-api.md).
+
 ## Selecting a profile
 
 ```sh

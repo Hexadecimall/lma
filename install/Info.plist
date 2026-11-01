@@ -8,8 +8,8 @@
     <key>CFBundleIdentifier</key><string>org.lma.app</string>
     <key>CFBundleExecutable</key><string>lma-desktop</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.3.2</string>
-    <key>CFBundleVersion</key><string>0.3.2</string>
+    <key>CFBundleShortVersionString</key><string>0.3.3</string>
+    <key>CFBundleVersion</key><string>0.3.3</string>
     <key>NSHighResolutionCapable</key><true />
     <key>NSMicrophoneUsageDescription</key><string
         >Record audio for local dictation. Audio stays on this device.</string>

@@ -84,6 +84,8 @@ struct Parsed {
     options: Options,
     stream: bool,
     include_usage: bool,
+    controls: super::generation_controls::GenerationControls,
+    output_schema: Option<Value>,
 }
 impl Parsed {
     fn parse(state: &AppState, body: Value, family: Family) -> Result<Self, ApiError> {
@@ -108,6 +110,16 @@ impl Parsed {
                     "user",
                     "service_tier",
                     "reasoning_effort",
+                    "stop",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "logit_bias",
+                    "n",
+                    "logprobs",
+                    "top_logprobs",
+                    "response_format",
+                    "modalities",
+                    "audio",
                 ],
                 Family::Messages => &[
                     "model",
@@ -206,15 +218,27 @@ impl Parsed {
                 return Err(invalid("unsupported reasoning summary hint"));
             }
         }
+        if family == Family::Chat {
+            super::openai::single_choice(&body, true)?;
+        }
+        let controls = super::openai::controls(&body)?;
+        let mut output_schema = if family == Family::Chat {
+            super::openai::response_schema(body.get("response_format"))?
+        } else {
+            None
+        };
         if let Some(text) = body.get("text") {
             fields(text, &["format", "verbosity"])?;
             if let Some(format) = text.get("format") {
-                fields(format, &["type"])?;
-                if format["type"] != "text" {
-                    return Err(invalid(
-                        "only text output format is supported; tool arguments use their own constrained schemas",
-                    ));
-                }
+                let normalized = if format["type"] == "json_schema" {
+                    fields(format, &["type", "name", "schema", "strict", "description"])?;
+                    let mut descriptor = format.clone();
+                    descriptor.as_object_mut().unwrap().remove("type");
+                    json!({"type":"json_schema", "json_schema":descriptor})
+                } else {
+                    format.clone()
+                };
+                output_schema = super::openai::response_schema(Some(&normalized))?;
             }
             if let Some(verbosity) = text.get("verbosity")
                 && !matches!(string(verbosity)?, "low" | "medium" | "high")
@@ -235,6 +259,11 @@ impl Parsed {
         }
         let parallel = boolean(&body, "parallel_tool_calls", true)?;
         let mut plan = Plan::parse(body.get("tools"), body.get("tool_choice"), family, parallel)?;
+        if output_schema.is_some() && plan.constrained() {
+            return Err(invalid(
+                "structured response_format and function-tool generation cannot be combined in one request yet",
+            ));
+        }
         if body.get("max_tool_calls").is_some() {
             let limit = uint(&body, "max_tool_calls", tools::MAX_CALLS as u32)? as usize;
             if limit == 0 || limit > tools::MAX_CALLS {
@@ -280,6 +309,8 @@ impl Parsed {
             options,
             stream,
             include_usage,
+            controls,
+            output_schema,
         })
     }
 }
@@ -297,6 +328,8 @@ fn reasoning_effort(value: &Value) -> Result<(), ApiError> {
 pub(super) async fn completion_stream(
     state: AppState,
     request: GenerationRequest,
+    include_usage: bool,
+    echo: Option<String>,
 ) -> Result<Response, ApiError> {
     let (id, created) = identifier(&state, "cmpl");
     let response_id = id.clone();
@@ -309,6 +342,15 @@ pub(super) async fn completion_stream(
                 "choices":[{"index":0,"text":text,"logprobs":null,"finish_reason":finish}]
             })
         };
+        if let Some(echo) = echo
+            && !send_events(
+                &send,
+                vec![Event::default().json_data(chunk(&echo, None)).unwrap()],
+            )
+            .await
+        {
+            return;
+        }
         let mut emitted = String::new();
         loop {
             let event = tokio::select! { _=send.closed()=>return, event=native.recv()=>event };
@@ -326,16 +368,19 @@ pub(super) async fn completion_stream(
                     None
                 }
                 Some(GenerationEvent::Finished(Ok(result))) if result.text == emitted => {
-                    let mut terminal = chunk("", Some(result.finish_reason));
-                    terminal["usage"] = json!({"prompt_tokens":result.prompt_tokens,"completion_tokens":result.completion_tokens,"total_tokens":result.prompt_tokens+result.completion_tokens});
-                    let _ = send_events(
-                        &send,
-                        vec![
-                            Event::default().json_data(terminal).unwrap(),
-                            Event::default().data("[DONE]"),
-                        ],
-                    )
-                    .await;
+                    let mut events = vec![
+                        Event::default()
+                            .json_data(chunk("", Some(result.finish_reason)))
+                            .unwrap(),
+                    ];
+                    if include_usage {
+                        events.push(Event::default().json_data(json!({
+                            "id":id,"object":"text_completion","created":created,"model":state.model_id,"choices":[],
+                            "usage":{"prompt_tokens":result.prompt_tokens,"completion_tokens":result.completion_tokens,"total_tokens":result.prompt_tokens+result.completion_tokens}
+                        })).unwrap());
+                    }
+                    events.push(Event::default().data("[DONE]"));
+                    let _ = send_events(&send, events).await;
                     return;
                 }
                 Some(GenerationEvent::Finished(Ok(_))) => Some(ApiError::new(
@@ -410,8 +455,11 @@ async fn generate(state: AppState, parsed: Parsed, family: Family) -> Result<Res
         .messages
         .iter()
         .any(|message| message.role == "system");
+    let output_schema = parsed.output_schema.clone();
+    let prepare_schema = output_schema.clone();
     let prepare = move || {
-        let prompt = prepare_plan.prepare(history)?;
+        let prompt = super::openai::constrain(prepare_plan.prepare(history)?, prepare_schema)
+            .with_controls(parsed.controls);
         Ok(GenerationRequest {
             prompt: if has_definition {
                 prompt.with_request_system(explicit_system)
@@ -444,6 +492,7 @@ async fn generate(state: AppState, parsed: Parsed, family: Family) -> Result<Res
     };
     if !parsed.stream {
         let result = state.inference.generate_prepared(prepare).await?;
+        super::openai::validate_output(&result, output_schema.as_ref())?;
         let output = plan.decode(&result, &id)?;
         return Ok(headers(
             Json(frames.complete(&result, &output)).into_response(),
@@ -506,6 +555,12 @@ async fn generate(state: AppState, parsed: Parsed, family: Family) -> Result<Res
                             )),
                         )
                         .await;
+                        return;
+                    }
+                    if let Err(error) =
+                        super::openai::validate_output(&result, output_schema.as_ref())
+                    {
+                        let _ = send_events(&send, frames.error(error)).await;
                         return;
                     }
                     match plan.decode(&result, &frames.id) {

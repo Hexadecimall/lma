@@ -23,6 +23,7 @@ pub enum Job {
     Create(CreateConfig),
     Delete(DeleteConfig),
     Transcribe(crate::speech::TranscribeConfig),
+    Update(UpdateConfig),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -352,6 +353,12 @@ pub struct QuantizeConfig {
     pub leave_output: bool,
     pub allow_requantize: bool,
     pub force: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UpdateConfig {
+    pub check: bool,
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

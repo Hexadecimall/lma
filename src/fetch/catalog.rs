@@ -61,6 +61,27 @@ pub(super) fn discover_with_limit(
     lm_studio: bool,
     limit: u32,
 ) -> Catalog {
+    discover_mode(client, query, ollama, lm_studio, limit, false)
+}
+
+pub(super) fn discover_listing(
+    client: &Client,
+    query: &str,
+    ollama: bool,
+    lm_studio: bool,
+    limit: u32,
+) -> Catalog {
+    discover_mode(client, query, ollama, lm_studio, limit, true)
+}
+
+fn discover_mode(
+    client: &Client,
+    query: &str,
+    ollama: bool,
+    lm_studio: bool,
+    limit: u32,
+    listing: bool,
+) -> Catalog {
     let mut catalog = Catalog::default();
     if ollama {
         catalog.include(
@@ -72,8 +93,8 @@ pub(super) fn discover_with_limit(
     if lm_studio {
         catalog.include(
             Source::LmStudio,
-            hf_repo(query),
-            hf_candidates(client, query, limit),
+            !listing && hf_repo(query),
+            hf_candidates(client, query, limit, listing),
         );
     }
     catalog.sort_dedup();
@@ -174,8 +195,13 @@ fn hf_repo(query: &str) -> bool {
     query.split('/').count() == 2 && query.split('/').all(safe_component)
 }
 
-fn hf_candidates(client: &Client, query: &str, limit: u32) -> Result<Vec<Candidate>, String> {
-    if hf_repo(query) {
+fn hf_candidates(
+    client: &Client,
+    query: &str,
+    limit: u32,
+    listing: bool,
+) -> Result<Vec<Candidate>, String> {
+    if !listing && hf_repo(query) {
         let mut endpoint = url(&format!("{HF}/api/models/{query}"))?;
         endpoint.query_pairs_mut().append_pair("blobs", "true");
         let Some(metadata) = download::json(client, endpoint)? else {
@@ -191,14 +217,7 @@ fn hf_candidates(client: &Client, query: &str, limit: u32) -> Result<Vec<Candida
             metadata: Some(metadata),
         }]);
     }
-    let mut endpoint = url(&format!("{HF}/api/models"))?;
-    endpoint
-        .query_pairs_mut()
-        .append_pair("search", query)
-        .append_pair("filter", "gguf")
-        .append_pair("sort", "downloads")
-        .append_pair("direction", "-1")
-        .append_pair("limit", &limit.to_string());
+    let endpoint = hf_search_url(query, limit)?;
     let metadata =
         download::json(client, endpoint)?.ok_or("Hugging Face search endpoint returned 404")?;
     let results = metadata
@@ -223,6 +242,20 @@ fn hf_candidates(client: &Client, query: &str, limit: u32) -> Result<Vec<Candida
             })
         })
         .collect()
+}
+
+fn hf_search_url(query: &str, limit: u32) -> Result<Url, String> {
+    let mut endpoint = popular_url(limit)?;
+    if hf_repo(query) {
+        let (author, search) = query.split_once('/').unwrap();
+        endpoint
+            .query_pairs_mut()
+            .append_pair("author", author)
+            .append_pair("search", search);
+    } else {
+        endpoint.query_pairs_mut().append_pair("search", query);
+    }
+    Ok(endpoint)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -599,6 +632,26 @@ mod tests {
 
     fn hf(names: &[&str]) -> Value {
         json!({"id":"owner/model", "sha":"a".repeat(40), "siblings": names.iter().map(|name| json!({"rfilename":name, "size":10, "lfs":{"sha256":"b".repeat(64), "size":10}})).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn listing_owner_prefix_uses_search_not_an_exact_repository_url() {
+        let endpoint = hf_search_url("mradermacher/Mellum", 20).unwrap();
+        assert_eq!(endpoint.path(), "/api/models");
+        let pairs: std::collections::HashMap<_, _> = endpoint.query_pairs().into_owned().collect();
+        assert_eq!(pairs["author"], "mradermacher");
+        assert_eq!(pairs["search"], "Mellum");
+        assert_eq!(pairs["limit"], "20");
+        assert_eq!(pairs["filter"], "gguf");
+        let endpoint = hf_search_url("Qwen", 10).unwrap();
+        assert!(!endpoint.query_pairs().any(|(key, _)| key == "author"));
+        assert!(
+            endpoint
+                .query_pairs()
+                .any(|(key, value)| key == "search" && value == "Qwen")
+        );
+        // The same text remains an exact repository for download selection.
+        assert!(hf_repo("mradermacher/Mellum"));
     }
 
     #[test]

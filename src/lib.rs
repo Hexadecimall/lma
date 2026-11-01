@@ -10,3 +10,4 @@ pub mod runtime;
 pub mod speech;
 pub mod terminal_style;
 pub mod tui;
+mod update;

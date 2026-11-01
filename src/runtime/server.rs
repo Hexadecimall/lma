@@ -639,9 +639,76 @@ pub(super) fn validate_model(state: &AppState, model: Option<&str>) -> Result<()
 async fn completions(
     State(state): State<AppState>,
     until_context: Option<Extension<UntilContext>>,
-    payload: Result<Json<CompletionRequest>, JsonRejection>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let Json(request) = payload.map_err(ApiError::from_json)?;
+    let Json(mut body) = payload.map_err(ApiError::from_json)?;
+    super::tools::fields(
+        &body,
+        &[
+            "prompt",
+            "model",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "seed",
+            "stream",
+            "stop",
+            "frequency_penalty",
+            "presence_penalty",
+            "logit_bias",
+            "n",
+            "best_of",
+            "echo",
+            "suffix",
+            "logprobs",
+            "user",
+            "stream_options",
+        ],
+    )?;
+    super::openai::single_choice(&body, false)?;
+    let controls = super::openai::controls(&body)?;
+    let echo = body
+        .get("echo")
+        .filter(|v| !v.is_null())
+        .map(|v| {
+            v.as_bool()
+                .ok_or_else(|| ApiError::invalid("echo must be boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if body.get("suffix").is_some_and(|v| !v.is_null() && v != "") {
+        return Err(ApiError::invalid(
+            "suffix infill is model-specific; supply the model's full FIM prompt as prompt instead",
+        ));
+    }
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let include_usage = super::openai::stream_usage(&body, stream)?;
+    if let Some(prompts) = body.get("prompt").and_then(Value::as_array) {
+        if prompts.len() != 1 || !prompts[0].is_string() {
+            return Err(ApiError::invalid(
+                "prompt supports a string or one-element string array; batched/token-ID prompts are not implemented",
+            ));
+        }
+        body["prompt"] = prompts[0].clone();
+    }
+    for key in [
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+        "logit_bias",
+        "n",
+        "best_of",
+        "echo",
+        "suffix",
+        "logprobs",
+        "user",
+        "stream_options",
+    ] {
+        body.as_object_mut().unwrap().remove(key);
+    }
+    let request: CompletionRequest = serde_json::from_value(body).map_err(|_| {
+        ApiError::invalid("invalid completion prompt, model, sampling, token limit or stream field")
+    })?;
     let defaults = state.generation_defaults();
     let options = Options {
         until_context: until_context.is_some(),
@@ -654,14 +721,19 @@ async fn completions(
     if request.prompt.is_empty() {
         return Err(ApiError::invalid("prompt must be a nonempty string"));
     }
+    let echo = echo.then(|| request.prompt.clone());
     let generation = GenerationRequest {
-        prompt: Prompt::Text(request.prompt),
+        prompt: Prompt::Text(request.prompt).with_controls(controls),
         options,
     };
     if request.stream {
-        super::compat::completion_stream(state, generation).await
+        super::compat::completion_stream(state, generation, include_usage, echo).await
     } else {
-        Ok(generate(state, generation, false).await?.into_response())
+        let mut result = state.inference.generate(generation).await?;
+        if let Some(echo) = echo {
+            result.text.insert_str(0, &echo);
+        }
+        Ok(generation_response(state, result, false).into_response())
     }
 }
 
@@ -679,15 +751,6 @@ pub(super) fn prepare_chat_prompt(messages: Vec<ChatMessage>) -> Result<Prompt, 
     let messages =
         prepare_messages(messages).map_err(|error| InferenceError::Invalid(error.message))?;
     Ok(Prompt::Chat(messages))
-}
-
-async fn generate(
-    state: AppState,
-    request: GenerationRequest,
-    chat: bool,
-) -> Result<Json<Value>, ApiError> {
-    let result = state.inference.generate(request).await?;
-    Ok(generation_response(state, result, chat))
 }
 
 fn generation_response(state: AppState, result: Generation, chat: bool) -> Json<Value> {
@@ -946,7 +1009,9 @@ mod tests {
                 captured.lock().unwrap().push(request);
             } else {
                 match &request.prompt {
-                    Prompt::Constrained { .. } | Prompt::RequestSystem { .. } => {
+                    Prompt::Constrained { .. }
+                    | Prompt::RequestSystem { .. }
+                    | Prompt::Controls { .. } => {
                         panic!("use a tool-aware fixture for constrained prompts")
                     }
                     Prompt::Text(text) => assert_eq!(text, "hello"),
@@ -2100,9 +2165,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_followup_after_disconnect_waits_for_worker_cleanup() {
+        struct CleanupEngine {
+            cancelled: Arc<Notify>,
+            release: std::sync::mpsc::Receiver<()>,
+            discards: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Engine for CleanupEngine {
+            fn generate(
+                &mut self,
+                _: GenerationRequest,
+                _: &dyn Fn() -> bool,
+            ) -> Result<Generation, InferenceError> {
+                assert_eq!(
+                    self.discards.load(Ordering::SeqCst),
+                    1,
+                    "next generation overlapped cleanup"
+                );
+                Ok(Generation {
+                    text: "next".into(),
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    finish_reason: "stop",
+                })
+            }
+            fn generate_stream(
+                &mut self,
+                _: GenerationRequest,
+                cancelled: &dyn Fn() -> bool,
+                emit: &mut dyn FnMut(String) -> Result<(), InferenceError>,
+            ) -> Result<Generation, InferenceError> {
+                emit("first".into())?;
+                while !cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                self.cancelled.notify_one();
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+                Err(InferenceError::Unavailable)
+            }
+            fn discard_request_state(&mut self) {
+                self.discards.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let cancelled = Arc::new(Notify::new());
+        let discards = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel();
+        let engine = CleanupEngine {
+            cancelled: cancelled.clone(),
+            release: gate,
+            discards: discards.clone(),
+        };
+        let (inference, worker) = InferenceService::spawn(|| Ok(engine)).await.unwrap();
+        let app = router(AppState {
+            inference,
+            model_id: "example:latest".into(),
+            context: 1024,
+            metadata: None,
+            definition: None,
+            api_key: None,
+            next_id: Arc::new(AtomicU64::new(0)),
+            api: "all".into(),
+        });
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/completions",
+                json!({"prompt":"first","stream":true}),
+                None,
+            ))
+            .await
+            .unwrap();
+        let mut stream = response.into_body();
+        assert!(next_sse_frame(&mut stream).await.contains("first"));
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled.notified())
+            .await
+            .unwrap();
+        let followup_app = app.clone();
+        let followup = tokio::spawn(async move {
+            followup_app
+                .oneshot(request(
+                    "POST",
+                    "/v1/completions",
+                    json!({"prompt":"second"}),
+                    None,
+                ))
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!followup.is_finished());
+        assert_eq!(discards.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), followup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["choices"][0]["text"], "next");
+        drop(app);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_stop_sampling_echo_and_usage_options_reach_the_native_request() {
+        let (app, captured, worker) = capturing_app().await;
+        for path in ["/v1/completions", "/v1/chat/completions"] {
+            let mut body = if path == "/v1/completions" {
+                json!({"prompt":["hello"], "best_of":1})
+            } else {
+                json!({"messages":[{"role":"user","content":"hello"}], "logprobs":false, "top_logprobs":0, "modalities":["text"], "audio":null})
+            };
+            body.as_object_mut().unwrap().extend(json!({"n":1,"stop":["<|endoftext|>","END"],"frequency_penalty":0.5,"presence_penalty":-0.25,"logit_bias":{"42":2.0},"max_tokens":7}).as_object().unwrap().clone());
+            let response = app
+                .clone()
+                .oneshot(request("POST", path, body, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = response_json(response).await;
+            let requests = captured.lock().unwrap();
+            let Prompt::Controls { controls, .. } = &requests.last().unwrap().prompt else {
+                panic!("controls were not forwarded")
+            };
+            assert_eq!(controls.stop, ["<|endoftext|>", "END"]);
+            assert_eq!(controls.frequency_penalty, 0.5);
+            assert_eq!(controls.presence_penalty, -0.25);
+            assert_eq!(controls.logit_bias, [(42, 2.0)]);
+        }
+        for stream in [false, true] {
+            let body = json!({"prompt":"hello", "echo":true, "stream":stream, "stream_options":if stream { json!({"include_usage":true}) } else { Value::Null }});
+            let response = app
+                .clone()
+                .oneshot(request("POST", "/v1/completions", body, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let records = sse_records(std::str::from_utf8(&bytes).unwrap());
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter_map(|(_, r)| r["choices"][0]["text"].as_str())
+                        .collect::<String>(),
+                    "helloworld 🦀"
+                );
+                assert_eq!(records.last().unwrap().1["choices"], json!([]));
+                assert_eq!(records.last().unwrap().1["usage"]["total_tokens"], 5);
+            } else {
+                let body = response_json(response).await;
+                assert_eq!(body["choices"][0]["text"], "helloworld 🦀");
+                assert_eq!(body["usage"]["total_tokens"], 5);
+            }
+        }
+        drop(app);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_json_formats_forward_constraints_on_chat_and_responses() {
+        struct JsonEngine;
+        impl Engine for JsonEngine {
+            fn generate(
+                &mut self,
+                request: GenerationRequest,
+                _: &dyn Fn() -> bool,
+            ) -> Result<Generation, InferenceError> {
+                let Prompt::Constrained { schema, .. } = request.prompt else {
+                    panic!("missing native grammar constraint")
+                };
+                assert_eq!(schema["type"], "object");
+                Ok(Generation {
+                    text: "{\"ok\":true}".into(),
+                    prompt_tokens: 2,
+                    completion_tokens: 5,
+                    finish_reason: "stop",
+                })
+            }
+        }
+        let (inference, worker) = InferenceService::spawn(|| Ok(JsonEngine)).await.unwrap();
+        let app = router(AppState {
+            inference,
+            model_id: "example:latest".into(),
+            context: 1024,
+            metadata: None,
+            definition: None,
+            api_key: None,
+            next_id: Arc::new(AtomicU64::new(0)),
+            api: "all".into(),
+        });
+        let schema = json!({"type":"object","properties":{"ok":{"const":true}},"required":["ok"],"additionalProperties":false});
+        for stream in [false, true] {
+            for (path, body) in [
+                (
+                    "/v1/chat/completions",
+                    json!({"messages":[{"role":"user","content":"JSON"}],"response_format":{"type":"json_object"},"stream":stream}),
+                ),
+                (
+                    "/v1/chat/completions",
+                    json!({"messages":[{"role":"user","content":"JSON"}],"response_format":{"type":"json_schema","json_schema":{"name":"Result","strict":true,"schema":schema}},"stream":stream}),
+                ),
+                (
+                    "/v1/responses",
+                    json!({"model":"example:latest","input":"JSON","text":{"format":{"type":"json_schema","name":"Result","strict":true,"schema":schema}},"stream":stream}),
+                ),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(request("POST", path, body, None))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("ok"), "{text}");
+                assert!(!text.contains("invalid_structured_output"), "{text}");
+            }
+        }
+        drop(app);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn invalid_requests_never_reach_inference() {
         let (app, calls, worker) = app(None).await;
-        let mut invalid = vec![json!({}), json!({"prompt":""}), json!({"prompt":["hello"]})];
+        let mut invalid = vec![
+            json!({}),
+            json!({"prompt":""}),
+            json!({"prompt":["hello", "world"]}),
+        ];
         for (field, value) in [
             ("stream", json!("true")),
             ("model", json!("wrong")),
@@ -2114,7 +2409,7 @@ mod tests {
             ("top_p", json!(0)),
             ("top_p", json!(1.1)),
             ("seed", json!(-1)),
-            ("stop", json!("end")),
+            ("stop", json!("")),
             ("tools", json!([])),
             ("n", json!(2)),
             ("logprobs", json!(1)),
@@ -3284,9 +3579,9 @@ mod tests {
 
     fn fixture_prompt_tokens(prompt: &Prompt) -> usize {
         match prompt {
-            Prompt::Constrained { prompt, .. } | Prompt::RequestSystem { prompt, .. } => {
-                fixture_prompt_tokens(prompt)
-            }
+            Prompt::Constrained { prompt, .. }
+            | Prompt::RequestSystem { prompt, .. }
+            | Prompt::Controls { prompt, .. } => fixture_prompt_tokens(prompt),
             Prompt::Text(text) => 2 + text.split_whitespace().count(),
             Prompt::Chat(messages) => {
                 2 + messages
@@ -4038,7 +4333,15 @@ mod tests {
                         } else {
                             assert!(text.contains("data: [DONE]"));
                             let records = sse_records(&text);
-                            assert_eq!(records.last().unwrap().1["usage"]["total_tokens"], 5);
+                            assert!(
+                                records.last().unwrap().1["choices"][0]["finish_reason"]
+                                    .is_string()
+                            );
+                            assert!(
+                                records
+                                    .iter()
+                                    .all(|(_, record)| record.get("usage").is_none())
+                            );
                         }
                     }
                     drop(app);

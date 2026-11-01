@@ -11,6 +11,7 @@ mod quantize;
 mod serve;
 mod stop;
 mod transcribe;
+mod update;
 
 use crate::config::Plan;
 use args::{Args, short_arguments};
@@ -42,6 +43,7 @@ pub(super) enum Command {
     Create,
     Delete,
     Transcribe,
+    Update,
 }
 
 pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, String> {
@@ -85,6 +87,7 @@ fn command_named(command: &OsStr) -> Option<Command> {
         "d" => Some(Command::Delete),
         "t" => Some(Command::Transcribe),
         "i" => Some(Command::Image),
+        "u" => Some(Command::Update),
         _ => None,
     }
 }
@@ -103,6 +106,7 @@ pub(super) fn nss_command_named(command: &OsStr) -> Option<Command> {
         "create" => Some(Command::Create),
         "delete" => Some(Command::Delete),
         "transcribe" => Some(Command::Transcribe),
+        "update" => Some(Command::Update),
         _ => None,
     }
 }
@@ -123,6 +127,7 @@ fn parse_command(command: Command, args: Args, syntax: Syntax) -> Result<Action,
         Command::Create => create::parse(args),
         Command::Delete => delete::parse(args),
         Command::Transcribe => transcribe::parse(args),
+        Command::Update => update::parse(args),
     }
 }
 
@@ -149,7 +154,7 @@ mod tests {
     }
 
     const ROOT_COMMANDS: &[&str] = &[
-        "s", "sp", "lh", "l", "c", "q", "f", "i", "it", "ce", "d", "t",
+        "s", "sp", "lh", "l", "c", "q", "f", "i", "it", "ce", "d", "t", "u",
     ];
 
     #[test]
@@ -158,6 +163,7 @@ mod tests {
         for (argv, expected) in [
             (vec!["s", "-m", "model.gguf", "-d"], "serve"),
             (vec!["sp", "-m", "local:latest", "-d"], "stop"),
+            (vec!["u", "-c", "-d"], "update"),
             (vec!["lh", "-i", "-d"], "launch"),
             (vec!["c", "-i", "-d"], "chat"),
             (vec!["l", "-j", "-dr", "local", "-o", "store", "-d"], "list"),
@@ -210,6 +216,7 @@ mod tests {
                 Job::Create(_) => "create",
                 Job::Delete(_) => "delete",
                 Job::Transcribe(_) => "transcribe",
+                Job::Update(_) => "update",
             };
             assert_eq!(actual, expected, "{argv:?}");
         }

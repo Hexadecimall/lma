@@ -1,4 +1,12 @@
-use std::{io::Read, num::NonZeroU32, sync::Arc};
+use std::{
+    io::Read,
+    num::NonZeroU32,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use encoding_rs::{CoderResult, Decoder, UTF_8};
 use llama_cpp_2::{
@@ -10,7 +18,7 @@ use llama_cpp_2::{
     llama_batch::LlamaBatch,
     model::{LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
-    token::LlamaToken,
+    token::{LlamaToken, logit_bias::LlamaLogitBias},
     vocab::BoundedVocabError,
 };
 use tokio::{
@@ -18,6 +26,7 @@ use tokio::{
     task::JoinHandle,
 };
 
+use super::generation_controls::{GenerationControls, StopFilter};
 use crate::config::{ServeConfig, backend_report};
 
 #[cfg(feature = "vision")]
@@ -43,6 +52,10 @@ pub(super) struct Message {
 pub(super) enum Prompt {
     Text(String),
     Chat(Vec<Message>),
+    Controls {
+        prompt: Box<Prompt>,
+        controls: GenerationControls,
+    },
     Constrained {
         prompt: Box<Prompt>,
         schema: serde_json::Value,
@@ -56,6 +69,28 @@ pub(super) enum Prompt {
 }
 
 impl Prompt {
+    pub(super) fn with_controls(self, controls: GenerationControls) -> Self {
+        if controls.is_default() {
+            self
+        } else {
+            Self::Controls {
+                prompt: Box::new(self),
+                controls,
+            }
+        }
+    }
+
+    // The outer controls are the request contract, like the outer schema.
+    fn generation_controls(&self) -> Option<&GenerationControls> {
+        match self {
+            Self::Controls { controls, .. } => Some(controls),
+            Self::Constrained { prompt, .. } | Self::RequestSystem { prompt, .. } => {
+                prompt.generation_controls()
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn with_request_system(self, explicit: bool) -> Self {
         Self::RequestSystem {
             prompt: Box::new(self),
@@ -67,9 +102,9 @@ impl Prompt {
         match self {
             Self::Text(_) => false,
             Self::Chat(messages) => messages.iter().any(|message| !message.images.is_empty()),
-            Self::Constrained { prompt, .. } | Self::RequestSystem { prompt, .. } => {
-                prompt.has_images()
-            }
+            Self::Constrained { prompt, .. }
+            | Self::RequestSystem { prompt, .. }
+            | Self::Controls { prompt, .. } => prompt.has_images(),
         }
     }
 
@@ -78,7 +113,9 @@ impl Prompt {
     fn output_schema(&self) -> Option<&serde_json::Value> {
         match self {
             Self::Constrained { schema, .. } => Some(schema),
-            Self::RequestSystem { prompt, .. } => prompt.output_schema(),
+            Self::RequestSystem { prompt, .. } | Self::Controls { prompt, .. } => {
+                prompt.output_schema()
+            }
             _ => None,
         }
     }
@@ -283,6 +320,11 @@ pub(super) enum GenerationEvent {
 const STREAM_CAPACITY: usize = 16;
 
 pub(super) trait Engine: Send + 'static {
+    // Model-dependent request validation must precede mutation and error cleanup.
+    fn validate_generation(&self, _request: &GenerationRequest) -> Result<(), InferenceError> {
+        Ok(())
+    }
+
     fn generate(
         &mut self,
         request: GenerationRequest,
@@ -450,10 +492,40 @@ struct Job {
     _permit: OwnedSemaphorePermit,
 }
 
+// This is not a general request queue: only a disconnected consumer can grant
+// one successor a short opportunity to wait for worker-owned cleanup.
+const CANCELLED_HANDOFF_TIMEOUT: Duration = Duration::from_millis(1500);
+
+enum Consumer {
+    Single(Arc<AtomicBool>),
+    Stream(mpsc::WeakSender<GenerationEvent>),
+    Untracked,
+}
+
+impl Consumer {
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Single(cancelled) => cancelled.load(Ordering::Acquire),
+            Self::Stream(reply) => reply.upgrade().is_none_or(|reply| reply.is_closed()),
+            Self::Untracked => false,
+        }
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct InferenceService {
     sender: mpsc::Sender<Job>,
     admission: Arc<Semaphore>,
+    consumer: Arc<Mutex<Consumer>>,
+    handoff_waiter: Arc<Semaphore>,
 }
 
 impl InferenceService {
@@ -495,6 +567,10 @@ impl InferenceService {
                 }
                 let (result, generated) = match request {
                     PreparedRequest::Generate(request) => {
+                        if let Err(error) = engine.validate_generation(&request) {
+                            let _ = job.reply.send(Err(error), job._permit);
+                            continue;
+                        }
                         let result = match &job.reply {
                             JobReply::Single(_) => {
                                 engine.generate(request, &|| job.reply.is_closed())
@@ -555,6 +631,8 @@ impl InferenceService {
             Self {
                 sender,
                 admission: Arc::new(Semaphore::new(1)),
+                consumer: Arc::new(Mutex::new(Consumer::Untracked)),
+                handoff_waiter: Arc::new(Semaphore::new(1)),
             },
             worker,
         ))
@@ -579,10 +657,13 @@ impl InferenceService {
         prepare: impl FnOnce() -> Result<GenerationRequest, InferenceError> + Send + 'static,
     ) -> Result<mpsc::Receiver<GenerationEvent>, InferenceError> {
         let (reply, receive) = mpsc::channel(STREAM_CAPACITY);
-        self.enqueue(
+        let consumer = Consumer::Stream(reply.downgrade());
+        self.enqueue_wait(
             JobRequest::Prepare(Box::new(prepare)),
             JobReply::Stream(reply),
-        )?;
+            consumer,
+        )
+        .await?;
         Ok(receive)
     }
 
@@ -642,21 +723,81 @@ impl InferenceService {
 
     async fn submit(&self, request: JobRequest) -> Result<JobResult, InferenceError> {
         let (reply, receive) = oneshot::channel();
-        self.enqueue(request, JobReply::Single(reply))?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+        self.enqueue_wait(
+            request,
+            JobReply::Single(reply),
+            Consumer::Single(cancelled),
+        )
+        .await?;
         let (result, permit) = receive.await.map_err(|_| InferenceError::Unavailable)?;
         drop(permit);
         result
     }
 
-    fn enqueue(&self, request: JobRequest, reply: JobReply) -> Result<(), InferenceError> {
+    async fn enqueue_wait(
+        &self,
+        request: JobRequest,
+        reply: JobReply,
+        consumer: Consumer,
+    ) -> Result<(), InferenceError> {
         if self.sender.is_closed() {
             return Err(InferenceError::Unavailable);
         }
+        let waiter = {
+            // Publish the new consumer atomically with immediate admission, so
+            // another caller cannot mistake it for the previous cancelled one.
+            let mut active = self.consumer.lock().unwrap();
+            if let Ok(permit) = self.admission.clone().try_acquire_owned() {
+                *active = consumer;
+                return self.enqueue_admitted(request, reply, permit);
+            }
+            if !active.is_cancelled() {
+                return Err(InferenceError::Busy);
+            }
+            self.handoff_waiter
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| InferenceError::Busy)?
+        };
+        // Nothing is prepared or sent until cleanup releases admission. Dropping
+        // this future removes its semaphore waiter and releases the one wait slot.
+        let permit = tokio::time::timeout(
+            CANCELLED_HANDOFF_TIMEOUT,
+            self.admission.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| InferenceError::Busy)?
+        .map_err(|_| InferenceError::Unavailable)?;
+        *self.consumer.lock().unwrap() = consumer;
+        let result = self.enqueue_admitted(request, reply, permit);
+        drop(waiter);
+        result
+    }
+
+    // Kept synchronous for model-free/native tests which inject abandoned jobs.
+    #[cfg(test)]
+    fn enqueue(&self, request: JobRequest, reply: JobReply) -> Result<(), InferenceError> {
+        let mut active = self.consumer.lock().unwrap();
         let permit = self
             .admission
             .clone()
             .try_acquire_owned()
             .map_err(|_| InferenceError::Busy)?;
+        *active = match &reply {
+            JobReply::Stream(reply) => Consumer::Stream(reply.downgrade()),
+            JobReply::Single(_) => Consumer::Untracked,
+        };
+        self.enqueue_admitted(request, reply, permit)
+    }
+
+    fn enqueue_admitted(
+        &self,
+        request: JobRequest,
+        reply: JobReply,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), InferenceError> {
         self.sender
             .try_send(Job {
                 request,
@@ -947,6 +1088,7 @@ impl LlamaEngine {
         cancelled: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(&str) -> Result<(), InferenceError>,
     ) -> Result<Generation, InferenceError> {
+        self.validate_generation(&request)?;
         self.session.with_dependent_mut(|loaded, session| {
             let result = session.generate(
                 &loaded.model,
@@ -1128,6 +1270,13 @@ impl LlamaEngine {
 }
 
 impl Engine for LlamaEngine {
+    fn validate_generation(&self, request: &GenerationRequest) -> Result<(), InferenceError> {
+        if let Some(controls) = request.prompt.generation_controls() {
+            controls.validate_vocab(self.session.borrow_owner().model.n_vocab())?;
+        }
+        Ok(())
+    }
+
     fn tokenize(
         &self,
         request: TokenizeRequest,
@@ -1519,8 +1668,23 @@ impl Session<'_> {
                 })
             })
             .transpose()?;
-        let greedy_fast_path = use_greedy_fast_path(&options, grammar.is_some());
-        let mut sampler = generation_sampler(grammar, &options);
+        let controls = request
+            .prompt
+            .generation_controls()
+            .cloned()
+            .unwrap_or_default();
+        // Reject IDs before prefill/reset or any other mutation of native state.
+        controls.validate_vocab(model.n_vocab())?;
+        let greedy_fast_path =
+            use_controlled_greedy_fast_path(&options, grammar.is_some(), &controls);
+        let mut sampler = generation_sampler_with_controls(
+            grammar,
+            &options,
+            &controls,
+            model.n_vocab(),
+            config.context,
+        );
+        let mut stops = StopFilter::new(controls.stop);
         ensure_active(cancelled)?;
         let (prompt, images) = format_prompt(
             model,
@@ -1607,13 +1771,17 @@ impl Session<'_> {
                 result.finish_reason = "stop";
                 break;
             }
-            append_stream_utf8(
+            if append_generation_utf8(
                 &mut decoder,
                 &vocab.token_to_piece(token, false, None),
                 &mut result.text,
                 false,
+                &mut stops,
                 emit,
-            )?;
+            )? {
+                result.finish_reason = "stop";
+                break;
+            }
             ensure_active(cancelled)?;
             if index + 1 < output_limit {
                 self.batch.clear();
@@ -1629,7 +1797,9 @@ impl Session<'_> {
                 position += 1;
             }
         }
-        append_stream_utf8(&mut decoder, &[], &mut result.text, true, emit)?;
+        if append_generation_utf8(&mut decoder, &[], &mut result.text, true, &mut stops, emit)? {
+            result.finish_reason = "stop";
+        }
         ensure_active(cancelled)?;
         if has_images {
             self.reset();
@@ -1688,8 +1858,46 @@ fn greedy_token(logits: &[f32]) -> Option<LlamaToken> {
     i32::try_from(selected).ok().map(LlamaToken)
 }
 
+fn use_controlled_greedy_fast_path(
+    options: &Options,
+    has_grammar: bool,
+    controls: &GenerationControls,
+) -> bool {
+    use_greedy_fast_path(options, has_grammar) && !controls.has_sampling()
+}
+
+#[cfg(test)]
 fn generation_sampler(grammar: Option<LlamaSampler>, options: &Options) -> LlamaSampler {
-    let mut chain = Vec::with_capacity(4);
+    generation_sampler_with_controls(grammar, options, &GenerationControls::default(), 0, 0)
+}
+
+fn generation_sampler_with_controls(
+    grammar: Option<LlamaSampler>,
+    options: &Options,
+    controls: &GenerationControls,
+    n_vocab: i32,
+    history_limit: u32,
+) -> LlamaSampler {
+    let mut chain = Vec::with_capacity(if controls.has_sampling() { 6 } else { 4 });
+    if controls.frequency_penalty != 0.0 || controls.presence_penalty != 0.0 {
+        // No prompt tokens are accepted. Keep the entire generated history, not
+        // a sliding repetition window; a request cannot exceed its context.
+        chain.push(LlamaSampler::penalties(
+            n_vocab,
+            history_limit.min(i32::MAX as u32) as i32,
+            1.0,
+            controls.frequency_penalty,
+            controls.presence_penalty,
+        ));
+    }
+    if controls.logit_bias.iter().any(|(_, bias)| *bias != 0.0) {
+        let biases: Vec<_> = controls
+            .logit_bias
+            .iter()
+            .map(|(token, bias)| LlamaLogitBias::new(LlamaToken(*token), *bias))
+            .collect();
+        chain.push(LlamaSampler::logit_bias(n_vocab, &biases));
+    }
     // Grammar must filter the full candidate set before any selection, including
     // greedy; appending it after selection does not enforce constrained output.
     chain.extend(grammar);
@@ -1879,9 +2087,9 @@ fn format_prompt_with(
 ) -> Result<(String, Vec<Vec<u8>>), InferenceError> {
     match prompt {
         Prompt::Text(text) => Ok((text, Vec::new())),
-        Prompt::Constrained { prompt, .. } | Prompt::RequestSystem { prompt, .. } => {
-            format_prompt_with(*prompt, has_images, render)
-        }
+        Prompt::Constrained { prompt, .. }
+        | Prompt::RequestSystem { prompt, .. }
+        | Prompt::Controls { prompt, .. } => format_prompt_with(*prompt, has_images, render),
         Prompt::Chat(mut messages) => {
             let images = if has_images {
                 attach_images(&mut messages)?
@@ -1951,6 +2159,27 @@ fn check_budget(prompt: usize, generated: u32, context: u32) -> Result<(), Infer
     Ok(())
 }
 
+fn append_generation_utf8(
+    decoder: &mut Decoder,
+    bytes: &[u8],
+    text: &mut String,
+    last: bool,
+    stops: &mut Option<StopFilter>,
+    emit: &mut dyn FnMut(&str) -> Result<(), InferenceError>,
+) -> Result<bool, InferenceError> {
+    let Some(stops) = stops else {
+        append_stream_utf8(decoder, bytes, text, last, emit)?;
+        return Ok(false);
+    };
+    let mut decoded = String::new();
+    append_utf8(decoder, bytes, &mut decoded, last)?;
+    stops.push(&decoded, last, &mut |delta| {
+        let start = text.len();
+        text.push_str(delta);
+        emit(&text[start..])
+    })
+}
+
 fn append_stream_utf8(
     decoder: &mut Decoder,
     bytes: &[u8],
@@ -1993,6 +2222,717 @@ mod native_tests;
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn controls_unwrap_without_losing_schema_images_or_request_system() {
+        assert!(matches!(
+            Prompt::Text("plain".into()).with_controls(GenerationControls::default()),
+            Prompt::Text(_)
+        ));
+        let schema = serde_json::json!({"type": "object"});
+        let controls = GenerationControls {
+            stop: vec!["END".into()],
+            ..Default::default()
+        };
+        let prompt = Prompt::Constrained {
+            prompt: Box::new(Prompt::Chat(vec![message("user", "hello world", vec![])])),
+            schema: schema.clone(),
+        }
+        .with_request_system(false)
+        .with_controls(controls.clone());
+        assert_eq!(prompt.output_schema(), Some(&schema));
+        assert_eq!(prompt.generation_controls().unwrap().stop, ["END"]);
+        assert_eq!(fixture_token_count(&prompt), 7);
+        assert!(!prompt.has_images());
+        let definition = crate::models::modelfile::parse("FROM base\nSYSTEM stored").unwrap();
+        let profiled = super::super::chat::profile_prompt(prompt, Some(&definition));
+        assert_eq!(profiled.output_schema(), Some(&schema));
+        let (text, _) = format_prompt_with(profiled, false, &mut |messages| {
+            assert_eq!(messages[0].role, "system");
+            assert_eq!(messages[0].content, "stored");
+            Ok(messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("|"))
+        })
+        .unwrap();
+        assert_eq!(text, "stored|hello world");
+        let image = Prompt::Chat(vec![message("user", "look", vec![vec![1]])])
+            .with_controls(controls)
+            .with_request_system(true);
+        assert!(image.has_images());
+        assert!(reject_count_images(&image).is_err());
+    }
+
+    fn candidates(logits: &[f32]) -> llama_cpp_2::token::data_array::LlamaTokenDataArray {
+        use llama_cpp_2::token::{data::LlamaTokenData, data_array::LlamaTokenDataArray};
+        LlamaTokenDataArray::new(
+            logits
+                .iter()
+                .enumerate()
+                .map(|(id, logit)| LlamaTokenData::new(LlamaToken(id as i32), *logit, 0.0))
+                .collect(),
+            false,
+        )
+    }
+
+    #[test]
+    fn native_controls_apply_openai_math_to_generated_history_only() {
+        for (frequency, presence) in [(0.5, 1.0), (-0.5, -1.0)] {
+            let controls = GenerationControls {
+                frequency_penalty: frequency,
+                presence_penalty: presence,
+                logit_bias: vec![(0, 0.25), (2, -2.0)],
+                ..Default::default()
+            };
+            let options = generation_request().options;
+            let mut sampler = generation_sampler_with_controls(None, &options, &controls, 3, 128);
+            let mut before = candidates(&[4.0, 3.0, 2.0]);
+            sampler.apply(&mut before);
+            assert_eq!(
+                before.data.iter().map(|t| t.logit()).collect::<Vec<_>>(),
+                [4.25, 3.0, 0.0]
+            );
+            // This is all generated history; prompt tokens never enter accept().
+            sampler.accept_many([LlamaToken(0), LlamaToken(0), LlamaToken(1)]);
+            let mut after = candidates(&[4.0, 3.0, 2.0]);
+            sampler.apply(&mut after);
+            assert_eq!(
+                after.data.iter().map(|t| t.logit()).collect::<Vec<_>>(),
+                [
+                    4.25 - 2.0 * frequency - presence,
+                    3.0 - frequency - presence,
+                    0.0,
+                ]
+            );
+        }
+        let controls = GenerationControls {
+            frequency_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut sampler = generation_sampler_with_controls(
+            None,
+            &generation_request().options,
+            &controls,
+            2,
+            128,
+        );
+        for expected in [0, 1, 0] {
+            let mut logits = candidates(&[2.0, 1.25]);
+            sampler.apply(&mut logits);
+            let token = logits.selected_token().unwrap();
+            assert_eq!(token, LlamaToken(expected));
+            sampler.accept(token); // Exactly once per selected token.
+        }
+        let mut sampler = generation_sampler_with_controls(
+            None,
+            &generation_request().options,
+            &controls,
+            2,
+            128,
+        );
+        sampler.accept(LlamaToken(0));
+        sampler.accept_many(std::iter::repeat_n(LlamaToken(1), 70));
+        let mut logits = candidates(&[2.0, 1.25]);
+        sampler.apply(&mut logits);
+        assert_eq!(
+            logits.data[0].logit(),
+            1.0,
+            "history must not use a 64-token repetition window"
+        );
+    }
+
+    #[test]
+    fn native_bias_changes_selection_but_never_bypasses_output_filter() {
+        for temperature in [0.0, 0.8] {
+            let mut options = generation_request().options;
+            options.temperature = temperature;
+            options.seed = Some(7);
+            let controls = GenerationControls {
+                logit_bias: vec![(0, 100.0)],
+                ..Default::default()
+            };
+            let mut sampler = generation_sampler_with_controls(None, &options, &controls, 2, 128);
+            let mut logits = candidates(&[-10.0, 1.0]);
+            sampler.apply(&mut logits);
+            assert_eq!(logits.selected_token(), Some(LlamaToken(0)));
+            // A model-free hard candidate mask stands in for the grammar filter.
+            let filter = LlamaSampler::logit_bias(
+                2,
+                &[LlamaLogitBias::new(LlamaToken(0), f32::NEG_INFINITY)],
+            );
+            let mut sampler =
+                generation_sampler_with_controls(Some(filter), &options, &controls, 2, 128);
+            let mut logits = candidates(&[-10.0, 1.0]);
+            sampler.apply(&mut logits);
+            assert_eq!(logits.selected_token(), Some(LlamaToken(1)));
+        }
+    }
+
+    #[test]
+    fn unused_controls_preserve_greedy_shortcut_and_native_chain() {
+        let options = generation_request().options;
+        for controls in [
+            GenerationControls::default(),
+            GenerationControls {
+                stop: vec!["END".into()],
+                ..Default::default()
+            },
+            GenerationControls {
+                logit_bias: vec![(0, 0.0)],
+                ..Default::default()
+            },
+        ] {
+            assert!(use_controlled_greedy_fast_path(&options, false, &controls));
+            assert!(!use_controlled_greedy_fast_path(&options, true, &controls));
+            let baseline = format!("{:?}", generation_sampler(None, &options));
+            let controlled = format!(
+                "{:?}",
+                generation_sampler_with_controls(None, &options, &controls, 2, 128)
+            );
+            assert_eq!(baseline, controlled);
+        }
+        for controls in [
+            GenerationControls {
+                frequency_penalty: -1.0,
+                ..Default::default()
+            },
+            GenerationControls {
+                presence_penalty: 1.0,
+                ..Default::default()
+            },
+            GenerationControls {
+                logit_bias: vec![(0, -1.0)],
+                ..Default::default()
+            },
+        ] {
+            assert!(!use_controlled_greedy_fast_path(&options, false, &controls));
+        }
+    }
+
+    struct StopFixture {
+        pieces: Vec<Vec<u8>>,
+        eos: bool,
+        sampled: Arc<AtomicUsize>,
+    }
+
+    impl Engine for StopFixture {
+        fn generate(
+            &mut self,
+            request: GenerationRequest,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            self.generate_stream(request, cancelled, &mut |_| Ok(()))
+        }
+
+        fn generate_stream(
+            &mut self,
+            request: GenerationRequest,
+            cancelled: &dyn Fn() -> bool,
+            emit: &mut dyn FnMut(String) -> Result<(), InferenceError>,
+        ) -> Result<Generation, InferenceError> {
+            let controls = request
+                .prompt
+                .generation_controls()
+                .cloned()
+                .unwrap_or_default();
+            let mut stops = StopFilter::new(controls.stop);
+            let mut decoder = UTF_8.new_decoder_without_bom_handling();
+            let mut result = Generation {
+                text: String::new(),
+                prompt_tokens: 5,
+                completion_tokens: 0,
+                finish_reason: "length",
+            };
+            for piece in self.pieces.iter().take(request.options.max_tokens as usize) {
+                ensure_active(cancelled)?;
+                self.sampled.fetch_add(1, Ordering::SeqCst);
+                result.completion_tokens += 1;
+                if append_generation_utf8(
+                    &mut decoder,
+                    piece,
+                    &mut result.text,
+                    false,
+                    &mut stops,
+                    &mut |delta| emit(delta.to_owned()),
+                )? {
+                    result.finish_reason = "stop";
+                    break;
+                }
+            }
+            if self.eos
+                && result.finish_reason != "stop"
+                && result.completion_tokens < request.options.max_tokens as usize
+            {
+                self.sampled.fetch_add(1, Ordering::SeqCst);
+                result.completion_tokens += 1;
+                result.finish_reason = "stop";
+            }
+            if append_generation_utf8(
+                &mut decoder,
+                &[],
+                &mut result.text,
+                true,
+                &mut stops,
+                &mut |delta| emit(delta.to_owned()),
+            )? {
+                result.finish_reason = "stop";
+            }
+            Ok(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_fixture_stream_and_single_keep_actual_usage_without_leaking_split_utf8() {
+        let cases = [
+            (
+                vec![
+                    b"hello ".to_vec(),
+                    vec![0xf0, 0x9f],
+                    vec![0xa6, 0x80],
+                    "終later".as_bytes().to_vec(),
+                    b"NEVER".to_vec(),
+                ],
+                vec!["🦀終"],
+                false,
+                "hello ",
+                4,
+                "stop",
+            ),
+            (
+                vec![b"ok END ignored".to_vec(), b"NEVER".to_vec()],
+                vec!["ignored", "END"],
+                false,
+                "ok ",
+                1,
+                "stop",
+            ),
+            (
+                vec![b"hello EN".to_vec()],
+                vec!["END"],
+                true,
+                "hello EN",
+                2,
+                "stop",
+            ),
+            (
+                vec![b"hello EN".to_vec()],
+                vec!["END"],
+                false,
+                "hello EN",
+                1,
+                "length",
+            ),
+        ];
+        for (pieces, stops, eos, text, usage, reason) in cases {
+            let sampled = Arc::new(AtomicUsize::new(0));
+            let engine = StopFixture {
+                pieces,
+                eos,
+                sampled: sampled.clone(),
+            };
+            let (service, worker) = InferenceService::spawn(move || Ok(engine)).await.unwrap();
+            let controls = GenerationControls {
+                stop: stops.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            };
+            let request = move || {
+                let mut request = generation_request();
+                request.options.max_tokens = 100;
+                request.prompt = request.prompt.with_controls(controls.clone());
+                request
+            };
+            let single = service.generate(request()).await.unwrap();
+            assert_eq!(single.text, text);
+            assert_eq!(single.completion_tokens, usage);
+            assert_eq!(single.finish_reason, reason);
+            let mut stream = service
+                .stream_prepared(move || Ok(request()))
+                .await
+                .unwrap();
+            let mut deltas = String::new();
+            let mut finished = false;
+            while let Some(event) = stream.recv().await {
+                match event {
+                    GenerationEvent::Delta(delta) => deltas.push_str(&delta),
+                    GenerationEvent::Finished(result) => {
+                        let result = result.unwrap();
+                        assert_eq!(result.text, text);
+                        assert_eq!(result.completion_tokens, usage);
+                        assert_eq!(result.finish_reason, reason);
+                        assert_eq!(result.prompt_tokens, 5);
+                        finished = true;
+                    }
+                }
+            }
+            assert!(finished);
+            assert_eq!(deltas, text);
+            assert_eq!(sampled.load(Ordering::SeqCst), usage * 2);
+            drop(service);
+            worker.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn stop_filter_is_safe_at_every_byte_split_and_flushes_unmatched_utf8_suffixes() {
+        let bytes = "café 🦀終hidden".as_bytes();
+        for first in 0..=bytes.len() {
+            for second in first..=bytes.len() {
+                let mut decoder = UTF_8.new_decoder_without_bom_handling();
+                let mut stops = StopFilter::new(vec!["🦀終".into(), "hidden".into()]);
+                let mut text = String::new();
+                let mut deltas = String::new();
+                for chunk in [&bytes[..first], &bytes[first..second], &bytes[second..]] {
+                    if append_generation_utf8(
+                        &mut decoder,
+                        chunk,
+                        &mut text,
+                        false,
+                        &mut stops,
+                        &mut |delta| {
+                            deltas.push_str(delta);
+                            Ok(())
+                        },
+                    )
+                    .unwrap()
+                    {
+                        break;
+                    }
+                }
+                assert!(
+                    append_generation_utf8(
+                        &mut decoder,
+                        &[],
+                        &mut text,
+                        true,
+                        &mut stops,
+                        &mut |delta| {
+                            deltas.push_str(delta);
+                            Ok(())
+                        }
+                    )
+                    .unwrap()
+                );
+                assert_eq!(text, "café ", "splits {first}, {second}");
+                assert_eq!(deltas, text);
+            }
+        }
+        for tail in ["🦀".as_bytes(), b"\xf0\x9f".as_slice()] {
+            let mut decoder = UTF_8.new_decoder_without_bom_handling();
+            let mut stops = StopFilter::new(vec!["🦀終".into()]);
+            let mut text = String::new();
+            append_generation_utf8(
+                &mut decoder,
+                tail,
+                &mut text,
+                false,
+                &mut stops,
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+            assert!(text.is_empty());
+            assert!(
+                !append_generation_utf8(
+                    &mut decoder,
+                    &[],
+                    &mut text,
+                    true,
+                    &mut stops,
+                    &mut |_| Ok(())
+                )
+                .unwrap()
+            );
+            assert_eq!(text, if tail.len() == 4 { "🦀" } else { "\u{fffd}" });
+        }
+    }
+
+    struct VocabValidationFixture {
+        calls: Arc<AtomicUsize>,
+        discards: Arc<AtomicUsize>,
+    }
+
+    impl Engine for VocabValidationFixture {
+        fn validate_generation(&self, request: &GenerationRequest) -> Result<(), InferenceError> {
+            if let Some(controls) = request.prompt.generation_controls() {
+                controls.validate_vocab(3)?;
+            }
+            Ok(())
+        }
+
+        fn generate(
+            &mut self,
+            _: GenerationRequest,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Generation {
+                text: "ok".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                finish_reason: "stop",
+            })
+        }
+
+        fn discard_request_state(&mut self) {
+            self.discards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_bias_id_is_rejected_before_generation_or_discard_including_zero_bias() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let discards = Arc::new(AtomicUsize::new(0));
+        let engine = VocabValidationFixture {
+            calls: calls.clone(),
+            discards: discards.clone(),
+        };
+        let (service, worker) = InferenceService::spawn(move || Ok(engine)).await.unwrap();
+        let invalid = || {
+            let mut request = generation_request();
+            request.prompt = request.prompt.with_controls(GenerationControls {
+                logit_bias: vec![(3, 0.0)],
+                ..Default::default()
+            });
+            request
+        };
+        assert!(matches!(
+            service.generate(invalid()).await,
+            Err(InferenceError::Invalid(_))
+        ));
+        let mut stream = service
+            .stream_prepared(move || Ok(invalid()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.recv().await,
+            Some(GenerationEvent::Finished(Err(InferenceError::Invalid(_))))
+        ));
+        assert!(stream.recv().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(discards.load(Ordering::SeqCst), 0);
+        service.generate(generation_request()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(discards.load(Ordering::SeqCst), 0);
+        drop(service);
+        worker.await.unwrap();
+    }
+
+    struct SlowCleanupFixture {
+        entered: Arc<tokio::sync::Notify>,
+        cleanup: Arc<tokio::sync::Notify>,
+        release: std::sync::mpsc::Receiver<()>,
+        calls: Arc<AtomicUsize>,
+        cleaned: Arc<AtomicBool>,
+    }
+
+    impl Engine for SlowCleanupFixture {
+        fn generate(
+            &mut self,
+            _: GenerationRequest,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                while !cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                return Err(cancelled_error());
+            }
+            assert!(
+                self.cleaned.load(Ordering::SeqCst),
+                "successor overlapped native cleanup"
+            );
+            Ok(Generation {
+                text: "next".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                finish_reason: "stop",
+            })
+        }
+
+        fn discard_request_state(&mut self) {
+            self.cleanup.notify_one();
+            self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            self.cleaned.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn slow_cleanup_service() -> (
+        InferenceService,
+        JoinHandle<()>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        std::sync::mpsc::Sender<()>,
+        Arc<AtomicUsize>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let cleanup = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, wait) = std::sync::mpsc::channel();
+        let engine = SlowCleanupFixture {
+            entered: entered.clone(),
+            cleanup: cleanup.clone(),
+            release: wait,
+            calls: calls.clone(),
+            cleaned: Arc::new(AtomicBool::new(false)),
+        };
+        let (service, worker) = InferenceService::spawn(move || Ok(engine)).await.unwrap();
+        (service, worker, entered, cleanup, release, calls)
+    }
+
+    async fn wait_for_handoff(service: &InferenceService) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.handoff_waiter.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn immediate_followup_after_disconnect_waits_for_cleanup_without_overlap() {
+        for streaming in [false, true] {
+            let (service, worker, entered, cleanup, release, calls) = slow_cleanup_service().await;
+            let mut stream = None;
+            let mut single = None;
+            if streaming {
+                stream = Some(
+                    service
+                        .stream_prepared(|| Ok(generation_request()))
+                        .await
+                        .unwrap(),
+                );
+            } else {
+                single = Some(tokio::spawn({
+                    let service = service.clone();
+                    async move { service.generate(generation_request()).await }
+                }));
+            }
+            entered.notified().await;
+            assert!(matches!(
+                service
+                    .generate_prepared(|| panic!("active overlap prepared"))
+                    .await,
+                Err(InferenceError::Busy)
+            ));
+            drop(stream);
+            if let Some(single) = single {
+                single.abort();
+                let _ = single.await;
+            }
+            // Submit immediately, before waiting for native cancellation/cleanup.
+            let prepared = Arc::new(AtomicUsize::new(0));
+            let next = tokio::spawn({
+                let service = service.clone();
+                let prepared = prepared.clone();
+                async move {
+                    service
+                        .generate_prepared(move || {
+                            prepared.fetch_add(1, Ordering::SeqCst);
+                            Ok(generation_request())
+                        })
+                        .await
+                }
+            });
+            wait_for_handoff(&service).await;
+            cleanup.notified().await;
+            assert_eq!(service.admission.available_permits(), 0);
+            assert_eq!(prepared.load(Ordering::SeqCst), 0);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                service
+                    .stream_prepared(|| panic!("second waiter prepared"))
+                    .await,
+                Err(InferenceError::Busy)
+            ));
+            release.send(()).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), next)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.text, "next");
+            assert_eq!(prepared.load(Ordering::SeqCst), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            drop(service);
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_handoff_waiter_never_prepares_and_releases_its_wait_slot() {
+        let (service, worker, entered, cleanup, release, calls) = slow_cleanup_service().await;
+        let stream = service
+            .stream_prepared(|| Ok(generation_request()))
+            .await
+            .unwrap();
+        entered.notified().await;
+        drop(stream);
+        cleanup.notified().await;
+        for streaming in [false, true] {
+            let waiter = tokio::spawn({
+                let service = service.clone();
+                async move {
+                    if streaming {
+                        service
+                            .stream_prepared(|| panic!("aborted stream waiter prepared"))
+                            .await
+                            .map(|_| ())
+                    } else {
+                        service
+                            .generate_prepared(|| panic!("aborted waiter prepared"))
+                            .await
+                            .map(|_| ())
+                    }
+                }
+            });
+            wait_for_handoff(&service).await;
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            assert_eq!(service.handoff_waiter.available_permits(), 1);
+            assert_eq!(service.admission.available_permits(), 0);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(2), service.admission.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        service.generate(generation_request()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(service);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handoff_wait_timeout_is_bounded_and_does_not_release_native_admission() {
+        let (service, worker, entered, cleanup, release, calls) = slow_cleanup_service().await;
+        let stream = service
+            .stream_prepared(|| Ok(generation_request()))
+            .await
+            .unwrap();
+        entered.notified().await;
+        drop(stream);
+        cleanup.notified().await;
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.generate_prepared(|| panic!("timed out waiter prepared")),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(InferenceError::Busy)));
+        assert!(start.elapsed() >= CANCELLED_HANDOFF_TIMEOUT);
+        assert_eq!(service.admission.available_permits(), 0);
+        assert_eq!(service.handoff_waiter.available_permits(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        drop(service);
+        worker.await.unwrap();
+    }
 
     fn embedding_request() -> EmbeddingRequest {
         EmbeddingRequest {
@@ -3259,9 +4199,9 @@ mod tests {
 
     fn fixture_token_count(prompt: &Prompt) -> usize {
         match prompt {
-            Prompt::Constrained { prompt, .. } | Prompt::RequestSystem { prompt, .. } => {
-                fixture_token_count(prompt)
-            }
+            Prompt::Constrained { prompt, .. }
+            | Prompt::RequestSystem { prompt, .. }
+            | Prompt::Controls { prompt, .. } => fixture_token_count(prompt),
             Prompt::Text(text) => 2 + text.split_whitespace().count(),
             Prompt::Chat(messages) => {
                 2 + messages

@@ -64,7 +64,12 @@ pub fn run(config: FetchConfig) -> Result<(), String> {
         }
         return Ok(());
     }
-    let catalog = catalog::discover_with_limit(
+    let discover = if config.list {
+        catalog::discover_listing
+    } else {
+        catalog::discover_with_limit
+    };
+    let catalog = discover(
         &client,
         query,
         config.ollama_database || both,

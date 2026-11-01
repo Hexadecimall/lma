@@ -214,6 +214,7 @@ fn short_flags(command: Command) -> &'static [(&'static str, &'static str, bool)
             ("-a", "--allow-requantize", false),
             ("-f", "--force", false),
         ],
+        Command::Update => &[("-c", "--check", false), ("-v", "--version", true)],
         Command::Transcribe => &[
             ("-m", "--model", true),
             ("-a", "--audio", true),
@@ -280,6 +281,7 @@ mod tests {
                 "pe:prompt-cache n:no-prompt-cache i:interactive",
             ),
             (&[Stop], "m:model ht:host p:port a:api-key", ""),
+            (&[Update], "v:version", "c:check"),
             (&[List], "dr:dir o:ollama-dir", "j:json"),
             (
                 &[Fetch],
