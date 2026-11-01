@@ -20,7 +20,7 @@ impl Source {
     pub fn label(self) -> &'static str {
         match self {
             Self::Ollama => "ollama",
-            Self::LmStudio => "lm-studio (public Hugging Face GGUF)",
+            Self::LmStudio => "huggingface (LM Studio-compatible GGUF)",
         }
     }
 
@@ -51,6 +51,16 @@ pub(super) struct Catalog {
 }
 
 pub(super) fn discover(client: &Client, query: &str, ollama: bool, lm_studio: bool) -> Catalog {
+    discover_with_limit(client, query, ollama, lm_studio, 10)
+}
+
+pub(super) fn discover_with_limit(
+    client: &Client,
+    query: &str,
+    ollama: bool,
+    lm_studio: bool,
+    limit: u32,
+) -> Catalog {
     let mut catalog = Catalog::default();
     if ollama {
         catalog.include(
@@ -63,7 +73,7 @@ pub(super) fn discover(client: &Client, query: &str, ollama: bool, lm_studio: bo
         catalog.include(
             Source::LmStudio,
             hf_repo(query),
-            hf_candidates(client, query),
+            hf_candidates(client, query, limit),
         );
     }
     catalog.sort_dedup();
@@ -164,7 +174,7 @@ fn hf_repo(query: &str) -> bool {
     query.split('/').count() == 2 && query.split('/').all(safe_component)
 }
 
-fn hf_candidates(client: &Client, query: &str) -> Result<Vec<Candidate>, String> {
+fn hf_candidates(client: &Client, query: &str, limit: u32) -> Result<Vec<Candidate>, String> {
     if hf_repo(query) {
         let mut endpoint = url(&format!("{HF}/api/models/{query}"))?;
         endpoint.query_pairs_mut().append_pair("blobs", "true");
@@ -186,7 +196,9 @@ fn hf_candidates(client: &Client, query: &str) -> Result<Vec<Candidate>, String>
         .query_pairs_mut()
         .append_pair("search", query)
         .append_pair("filter", "gguf")
-        .append_pair("limit", "10");
+        .append_pair("sort", "downloads")
+        .append_pair("direction", "-1")
+        .append_pair("limit", &limit.to_string());
     let metadata =
         download::json(client, endpoint)?.ok_or("Hugging Face search endpoint returned 404")?;
     let results = metadata
@@ -194,7 +206,7 @@ fn hf_candidates(client: &Client, query: &str) -> Result<Vec<Candidate>, String>
         .ok_or("expected a Hugging Face search result array")?;
     results
         .iter()
-        .take(10)
+        .take(limit as usize)
         .map(|entry| {
             let id = entry
                 .get("id")
@@ -211,6 +223,61 @@ fn hf_candidates(client: &Client, query: &str) -> Result<Vec<Candidate>, String>
             })
         })
         .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct PopularModel {
+    pub id: String,
+    pub downloads: u64,
+}
+
+fn popular_url(limit: u32) -> Result<Url, String> {
+    if !(1..=1000).contains(&limit) {
+        return Err("index must be between 1 and 1000".into());
+    }
+    let mut endpoint = url(&format!("{HF}/api/models"))?;
+    endpoint
+        .query_pairs_mut()
+        .append_pair("filter", "gguf")
+        .append_pair("sort", "downloads")
+        .append_pair("direction", "-1")
+        .append_pair("limit", &limit.to_string());
+    Ok(endpoint)
+}
+
+pub(super) fn popular(client: &Client, limit: u32) -> Result<Vec<PopularModel>, String> {
+    let metadata = download::json(client, popular_url(limit)?)?
+        .ok_or("Hugging Face popularity endpoint returned 404")?;
+    parse_popular(&metadata, limit)
+}
+
+fn parse_popular(metadata: &Value, limit: u32) -> Result<Vec<PopularModel>, String> {
+    let entries = metadata
+        .as_array()
+        .ok_or("expected a Hugging Face popularity result array")?;
+    let mut results: Vec<_> = entries
+        .iter()
+        .take(limit as usize)
+        .map(|entry| {
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| hf_repo(id))
+                .ok_or("popularity result has a missing or unsafe repository id")?;
+            let downloads = entry
+                .get("downloads")
+                .and_then(Value::as_u64)
+                .ok_or("popularity result has a missing or invalid download count")?;
+            Ok(PopularModel {
+                id: id.into(),
+                downloads,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    results.sort_by(|a, b| b.downloads.cmp(&a.downloads).then_with(|| a.id.cmp(&b.id)));
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|model| seen.insert(model.id.clone()));
+    Ok(results)
 }
 
 pub(super) struct Selection {
@@ -532,6 +599,61 @@ mod tests {
 
     fn hf(names: &[&str]) -> Value {
         json!({"id":"owner/model", "sha":"a".repeat(40), "siblings": names.iter().map(|name| json!({"rfilename":name, "size":10, "lfs":{"sha256":"b".repeat(64), "size":10}})).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn popularity_endpoint_is_ranked_by_downloads_and_bounded() {
+        let endpoint = popular_url(50).unwrap();
+        assert_eq!(endpoint.host_str(), Some("huggingface.co"));
+        let pairs: std::collections::HashMap<_, _> = endpoint.query_pairs().into_owned().collect();
+        assert_eq!(pairs["filter"], "gguf");
+        assert_eq!(pairs["sort"], "downloads");
+        assert_eq!(pairs["direction"], "-1");
+        assert_eq!(pairs["limit"], "50");
+        assert!(!pairs.contains_key("search"));
+        assert!(popular_url(0).is_err());
+        assert!(popular_url(1001).is_err());
+    }
+
+    #[test]
+    fn popular_models_have_truthful_counts_and_deterministic_bounded_ranking() {
+        let metadata = serde_json::json!([
+            {"id":"owner/z", "downloads":10},
+            {"id":"owner/b", "downloads":100},
+            {"id":"owner/a", "downloads":100},
+            {"id":"owner/b", "downloads":20},
+            {"id":"owner/zero", "downloads":0}
+        ]);
+        let models = parse_popular(&metadata, 50).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|m| (m.id.as_str(), m.downloads))
+                .collect::<Vec<_>>(),
+            vec![
+                ("owner/a", 100),
+                ("owner/b", 100),
+                ("owner/z", 10),
+                ("owner/zero", 0)
+            ]
+        );
+        assert_eq!(parse_popular(&metadata, 2).unwrap().len(), 2);
+        assert!(
+            parse_popular(&serde_json::json!([]), 50)
+                .unwrap()
+                .is_empty()
+        );
+        for invalid in [
+            serde_json::json!({"error":"bad"}),
+            serde_json::json!([{"id":"../bad", "downloads":1}]),
+            serde_json::json!([{"id":"owner/repo\n", "downloads":1}]),
+            serde_json::json!([{"id":"owner/repo"}]),
+            serde_json::json!([{"id":"owner/repo", "downloads":null}]),
+            serde_json::json!([{"id":"owner/repo", "downloads":-1}]),
+            serde_json::json!([{"id":"owner/repo", "downloads":1.5}]),
+        ] {
+            assert!(parse_popular(&invalid, 50).is_err(), "{invalid}");
+        }
     }
 
     #[test]

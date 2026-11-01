@@ -1,4 +1,4 @@
-//! Ollama wire adapters for one statically hosted model, not an Ollama daemon.
+//! Ollama wire adapters, shared by the managed HTTP host and pinned sessions.
 use std::{
     convert::Infallible,
     sync::atomic::Ordering,
@@ -46,9 +46,13 @@ fn boolean(body: &Value, key: &str, default: bool) -> Result<bool, ApiError> {
 }
 fn uint(body: &Value, key: &str, default: u32) -> Result<u32, ApiError> {
     body.get(key)
-        .map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| {
-            ApiError::invalid(format!("{key} must be an unsigned 32-bit integer; unlimited token budgets are unsupported"))
-        }))
+        .map(|v| {
+            v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    ApiError::invalid(format!("{key} must be an unsigned 32-bit integer"))
+                })
+        })
         .unwrap_or(Ok(default))
 }
 fn number(body: &Value, key: &str, default: f32) -> Result<f32, ApiError> {
@@ -99,6 +103,16 @@ struct Parsed {
 }
 impl Parsed {
     fn parse(state: &AppState, body: &Value, chat: bool) -> Result<Self, ApiError> {
+        validate_model(state, body.get("model").map(string).transpose()?)?;
+        Self::parse_for(state.context, state.definition.as_deref(), body, chat)
+    }
+
+    fn parse_for(
+        context: u32,
+        definition: Option<&crate::models::modelfile::Definition>,
+        body: &Value,
+        chat: bool,
+    ) -> Result<Self, ApiError> {
         fields(
             body,
             if chat {
@@ -127,7 +141,6 @@ impl Parsed {
                 ]
             },
         )?;
-        validate_model(state, body.get("model").map(string).transpose()?)?;
         if let Some(value) = body.get("keep_alive").filter(|v| !v.is_null())
             && value.as_i64() != Some(-1)
         {
@@ -153,15 +166,39 @@ impl Parsed {
             opts,
             &["num_predict", "temperature", "top_p", "seed", "num_ctx"],
         )?;
-        if opts.get("num_ctx").is_some() && uint(opts, "num_ctx", state.context)? != state.context {
+        if opts.get("num_ctx").is_some() && uint(opts, "num_ctx", context)? != context {
             return Err(ApiError::invalid(
-                "options.num_ctx must equal the hosted context; restart the server to change context size",
+                "options.num_ctx must equal the session context; use the managed HTTP host to resize context",
             ));
         }
-        let defaults = state.generation_defaults();
+        let defaults = super::server::generation_defaults(definition);
+        let definition_limit = definition.and_then(|definition| definition.parameters.num_predict);
+        let (until_context, max_tokens) = match opts.get("num_predict") {
+            Some(value) if value.as_i64() == Some(-1) => (true, context),
+            Some(value) if value.as_i64() == Some(-2) => {
+                return Err(ApiError::invalid(
+                    "options.num_predict=-2 (historical fill-context mode) is unsupported; use -1 for remaining context or a positive 32-bit integer",
+                ));
+            }
+            Some(value) => {
+                let limit = value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| {
+                        ApiError::invalid(
+                            "options.num_predict must be -1 (remaining context) or a positive 32-bit integer",
+                        )
+                    })?;
+                (false, limit)
+            }
+            None if definition_limit.is_some() => (false, defaults.max_tokens),
+            // Keep a valid placeholder; inference derives the actual remaining budget.
+            None => (true, context),
+        };
         let options = Options {
-            until_context: false,
-            max_tokens: uint(opts, "num_predict", defaults.max_tokens)?,
+            until_context,
+            max_tokens,
             temperature: number(opts, "temperature", defaults.temperature)?,
             top_p: number(opts, "top_p", defaults.top_p)?,
             seed: opts
@@ -170,7 +207,7 @@ impl Parsed {
                 .transpose()?
                 .or(defaults.seed),
         };
-        options.validate(state.context)?;
+        options.validate(context)?;
         let plan = Plan::parse(body.get("tools"), None, Family::Chat, true)?;
         let mut history = History::default();
         let mut raw = None;
@@ -222,6 +259,33 @@ impl Parsed {
             stream: boolean(body, "stream", true)?,
         })
     }
+}
+
+/// Validate against the prospective resident before a model/context switch.
+/// Explicit load requests use a placeholder only for prompt-presence validation;
+/// no prompt is evaluated and all supplied options/fields still pass the parser.
+pub(super) fn validate_request(
+    config: &crate::config::ServeConfig,
+    body: &Value,
+    chat: bool,
+    load_only: bool,
+) -> Result<(), ApiError> {
+    body.get("model").map(string).transpose()?;
+    let mut validation;
+    let body = if load_only {
+        validation = body.clone();
+        validation["prompt"] = json!("load validation");
+        &validation
+    } else {
+        body
+    };
+    let parsed = Parsed::parse_for(config.context, config.definition.as_ref(), body, chat)?;
+    if parsed.raw.is_none() {
+        // Decode/validate images and prepared tool history before a switch too.
+        // Model-specific formatting and context fit are checked by inference.
+        parsed.plan.prepare(parsed.history)?;
+    }
+    Ok(())
 }
 
 fn chat_history(body: &Value, plan: &Plan) -> Result<History, ApiError> {
@@ -594,6 +658,211 @@ fn show_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        models::modelfile::{Definition, Parameters},
+        runtime::inference::{Engine, InferenceError, InferenceService},
+    };
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    struct ParseFixture;
+
+    impl Engine for ParseFixture {
+        fn generate(
+            &mut self,
+            _: GenerationRequest,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            panic!("parse-only fixture must never generate or load a model")
+        }
+    }
+
+    async fn fixture() -> (AppState, tokio::task::JoinHandle<()>) {
+        let (inference, worker) = InferenceService::spawn(|| Ok(ParseFixture)).await.unwrap();
+        (
+            AppState {
+                inference,
+                model_id: "fixture".into(),
+                context: 1024,
+                metadata: None,
+                definition: None,
+                api_key: None,
+                next_id: Arc::new(AtomicU64::new(1)),
+                api: "all".into(),
+            },
+            worker,
+        )
+    }
+
+    fn request(chat: bool, stream: Option<bool>) -> Value {
+        let mut body = if chat {
+            json!({"messages":[{"role":"user","content":"hello"}]})
+        } else {
+            json!({"prompt":"hello"})
+        };
+        if let Some(stream) = stream {
+            body["stream"] = json!(stream);
+        }
+        body
+    }
+
+    fn definition(num_predict: Option<u32>) -> Arc<Definition> {
+        Arc::new(Definition {
+            from: "fixture".into(),
+            parameters: Parameters {
+                num_predict,
+                temperature: Some(0.3),
+                top_p: Some(0.4),
+                seed: Some(17),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn omitted_num_predict_uses_remaining_context_for_both_stream_modes() {
+        let (mut state, worker) = fixture().await;
+        for selected_definition in [None, Some(definition(None))] {
+            state.definition = selected_definition;
+            for chat in [false, true] {
+                for stream in [None, Some(true), Some(false)] {
+                    for options in [None, Some(json!({})), Some(json!({"temperature":0.5}))] {
+                        let mut body = request(chat, stream);
+                        if let Some(options) = options {
+                            body["options"] = options;
+                        }
+                        let parsed = Parsed::parse(&state, &body, chat).unwrap();
+                        assert_eq!(parsed.stream, stream.unwrap_or(true));
+                        assert!(parsed.options.until_context);
+                        assert_eq!(parsed.options.max_tokens, state.context);
+                    }
+                }
+            }
+        }
+        // The generic fallback must not become an implicit Ollama reply cap.
+        state.definition = None;
+        state.context = 64;
+        assert!(state.generation_defaults().max_tokens > state.context);
+        let parsed = Parsed::parse(&state, &request(false, None), false).unwrap();
+        assert!(parsed.options.until_context);
+        assert_eq!(parsed.options.max_tokens, 64);
+        drop(state);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_limits_override_definition_and_definition_overrides_omission() {
+        let (mut state, worker) = fixture().await;
+        for definition_limit in [None, Some(13), Some(256)] {
+            state.definition = Some(definition(definition_limit));
+            for chat in [false, true] {
+                for stream in [None, Some(true), Some(false)] {
+                    for limit in [None, Some(-1), Some(1), Some(7), Some(1024)] {
+                        let mut body = request(chat, stream);
+                        if let Some(limit) = limit {
+                            body["options"] = json!({"num_predict":limit});
+                        }
+                        let parsed = Parsed::parse(&state, &body, chat).unwrap();
+                        let remaining =
+                            limit == Some(-1) || (limit.is_none() && definition_limit.is_none());
+                        assert_eq!(parsed.options.until_context, remaining);
+                        assert_eq!(
+                            parsed.options.max_tokens,
+                            if remaining {
+                                state.context
+                            } else {
+                                limit.map(|n| n as u32).or(definition_limit).unwrap()
+                            }
+                        );
+                        assert_eq!(parsed.stream, stream.unwrap_or(true));
+                        assert_eq!(parsed.options.temperature, 0.3);
+                        assert_eq!(parsed.options.top_p, 0.4);
+                        assert_eq!(parsed.options.seed, Some(17));
+                    }
+                }
+            }
+        }
+        state.definition = None;
+        let body = json!({"prompt":"hello","options":{"num_predict":7}});
+        let parsed = Parsed::parse(&state, &body, false).unwrap();
+        assert!(!parsed.options.until_context);
+        assert_eq!(parsed.options.max_tokens, 7);
+        drop(state);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_num_predict_never_inherits_a_default() {
+        let (mut state, worker) = fixture().await;
+        for selected_definition in [None, Some(definition(Some(13)))] {
+            state.definition = selected_definition;
+            for chat in [false, true] {
+                for stream in [true, false] {
+                    for limit in [
+                        json!(0),
+                        json!(-2),
+                        json!(-3),
+                        json!(i64::MIN),
+                        json!(1.5),
+                        json!(-1.0),
+                        json!(null),
+                        json!(u64::from(u32::MAX) + 1),
+                        json!(u64::MAX),
+                        json!(1e100),
+                        json!("-1"),
+                        json!(true),
+                        json!([]),
+                        json!({}),
+                    ] {
+                        let mut body = request(chat, Some(stream));
+                        body["options"] = json!({"num_predict":limit});
+                        let error = Parsed::parse(&state, &body, chat)
+                            .err()
+                            .expect("invalid num_predict must be rejected");
+                        let value = error.ollama_value();
+                        let message = value["error"].as_str().unwrap();
+                        assert!(message.contains("options.num_predict"), "{message}");
+                        assert!(message.contains("-1"), "{message}");
+                        if limit == -2 {
+                            assert!(message.contains("fill-context"), "{message}");
+                        }
+                        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+                    }
+                }
+            }
+        }
+        drop(state);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remaining_context_preserves_context_and_sampling_validation() {
+        let (state, worker) = fixture().await;
+        for chat in [false, true] {
+            for stream in [true, false] {
+                for options in [
+                    json!({"num_predict":1025}),
+                    json!({"num_predict":u32::MAX}),
+                    json!({"num_predict":-1,"temperature":2.1}),
+                    json!({"num_predict":-1,"top_p":0}),
+                    json!({"num_predict":-1,"seed":-1}),
+                    json!({"num_predict":-1,"num_ctx":1025}),
+                    json!({"temperature":2.1}),
+                    json!({"top_p":0}),
+                ] {
+                    let mut body = request(chat, Some(stream));
+                    body["options"] = options;
+                    let error = Parsed::parse(&state, &body, chat)
+                        .err()
+                        .expect("token-budget mode must not bypass option validation");
+                    assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+                }
+            }
+        }
+        drop(state);
+        worker.await.unwrap();
+    }
+
     #[test]
     fn timestamps_are_utc_rfc3339() {
         assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000000000Z");

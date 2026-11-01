@@ -171,6 +171,7 @@ fn short_flags(command: Command) -> &'static [(&'static str, &'static str, bool)
         ],
         Command::Fetch => &[
             ("-l", "--list", false),
+            ("-i", "--index", true),
             ("-f", "--file", true),
             ("-o", "--out", true),
             ("-oe", "--ollama-database", false),
@@ -282,7 +283,7 @@ mod tests {
             (&[List], "dr:dir o:ollama-dir", "j:json"),
             (
                 &[Fetch],
-                "f:file o:out",
+                "f:file o:out i:index",
                 "l:list oe:ollama-database le:lm-studio-database",
             ),
             (

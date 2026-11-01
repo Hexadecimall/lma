@@ -1824,12 +1824,40 @@ fn fetch_dry_run_defaults_to_combined_catalogs_without_network_or_files() {
                     "ollama_database": true,
                     "lm_studio_database": true,
                     "list": false,
+                    "index": 50,
                     "file": null,
                     "output": temp.0.join(".lma/models")
                 }
             })
         );
         assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+        assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn fetch_popular_listing_and_index_are_network_free_in_dry_run() {
+    let temp = TempDir::new();
+    for (argv, expected) in [
+        (vec!["f", "-l", "-d"], 50),
+        (vec!["f", "-l", "-i", "20", "-d"], 20),
+        (
+            vec!["nss", "fetch", "--list", "--index=10", "--dry-run"],
+            10,
+        ),
+    ] {
+        let output = isolated_lma(&temp)
+            .env("HOME", &temp.0)
+            .env("USERPROFILE", &temp.0)
+            .args(argv)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let plan: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(plan["options"]["query"], "");
+        assert_eq!(plan["options"]["index"], expected);
+        assert_eq!(plan["options"]["list"], true);
+        assert!(stderr(&output).is_empty());
         assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 0);
     }
 }
@@ -2301,7 +2329,7 @@ fn root_help_is_a_local_versioned_command_tree() {
         "│  ├─ s -p FILE",
         "│  └─ s -ct PRESET",
         "├─ q INPUT",
-        "├─ f QUERY",
+        "├─ f [QUERY]",
         "├─ it",
         "├─ ce NAME",
         "├─ i DIR PROMPT",

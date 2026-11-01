@@ -51,6 +51,54 @@ pub(super) struct Host {
 }
 type Lease = OwnedRwLockReadGuard<Option<Loaded>>;
 
+struct OllamaRequest {
+    body: Value,
+    chat: bool,
+    load_only: bool,
+    context: Option<u32>,
+}
+
+impl OllamaRequest {
+    fn new(body: &Value, chat: bool, load_only: bool) -> Result<Self, ApiError> {
+        let context = body
+            .get("options")
+            .map(|options| {
+                let options = options
+                    .as_object()
+                    .ok_or_else(|| invalid("options must be an object"))?;
+                options
+                    .get("num_ctx")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .filter(|&n| (2..=i32::MAX as u64).contains(&n))
+                            .map(|n| n as u32)
+                            .ok_or_else(|| {
+                                invalid(
+                                    "options.num_ctx must be an integer between 2 and 2147483647",
+                                )
+                            })
+                    })
+                    .transpose()
+            })
+            .transpose()?
+            .flatten();
+        Ok(Self {
+            body: body.clone(),
+            chat,
+            load_only,
+            context,
+        })
+    }
+
+    fn apply(&self, config: &mut ServeConfig) -> Result<(), ApiError> {
+        if let Some(context) = self.context {
+            config.context = context;
+        }
+        super::ollama::validate_request(config, &self.body, self.chat, self.load_only)
+    }
+}
+
 // Run on a blocking worker and retain these paths from load time, rather than
 // resolving the resident's paths again after a symlink or catalog change.
 fn resident_config(mut config: ServeConfig) -> Result<ServeConfig, String> {
@@ -286,6 +334,32 @@ impl Host {
         resolve: impl FnOnce(Host, String) -> Result<ServeConfig, String> + Send + 'static,
         build: impl FnOnce(ServeConfig) -> F + Send + 'static,
     ) -> Result<Lease, ApiError> {
+        self.lease_request_with(model, None, resolve, build).await
+    }
+
+    async fn lease_ollama(
+        &self,
+        model: Option<String>,
+        request: OllamaRequest,
+    ) -> Result<Lease, ApiError> {
+        self.lease_request_with(
+            model,
+            Some(request),
+            |host, model| host.target(&model),
+            super::server::build,
+        )
+        .await
+    }
+
+    async fn lease_request_with<
+        F: Future<Output = Result<(Router, JoinHandle<()>), String>> + Send + 'static,
+    >(
+        &self,
+        model: Option<String>,
+        request: Option<OllamaRequest>,
+        resolve: impl FnOnce(Host, String) -> Result<ServeConfig, String> + Send + 'static,
+        build: impl FnOnce(ServeConfig) -> F + Send + 'static,
+    ) -> Result<Lease, ApiError> {
         // The exact public name addresses the loaded snapshot, even if its
         // catalog entry or startup symlink has changed. Unnamed startup files
         // already use their original filename as model_id (see resident_config).
@@ -296,7 +370,18 @@ impl Host {
             && model
                 .as_deref()
                 .is_none_or(|name| loaded.config.model_id.as_deref() == Some(name))
+            && request
+                .as_ref()
+                .and_then(|r| r.context)
+                .is_none_or(|context| context == loaded.config.context)
         {
+            // Empty load requests bypass the resident router, so validate here.
+            // Ordinary generation is parsed only once on the steady-state path.
+            if let Some(request) = &request
+                && request.load_only
+            {
+                request.apply(&mut loaded.config.clone())?;
+            }
             return Ok(guard);
         }
         // The owned task finishes a switch even if its HTTP caller disconnects.
@@ -307,17 +392,36 @@ impl Host {
                 .clone()
                 .try_lock_owned()
                 .map_err(|_| busy())?;
-            let model = model
-                .or_else(|| host.base.model_id.clone())
-                .or_else(|| host.base.model.file_name().map(|name| name.to_string_lossy().into_owned()))
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| invalid("model is required while no model is loaded; choose an installed name from /api/tags or /v1/models"))?;
-            let resolver = host.clone();
-            let config =
+            // Resizing the current public name uses its loaded snapshot, not a
+            // new catalog lookup that could retarget an alias behind the client.
+            let snapshot = if request.is_some() {
+                host.loaded.try_read().ok().and_then(|guard| {
+                    guard.as_ref().filter(|loaded| model.as_deref().is_none_or(|name| {
+                        loaded.config.model_id.as_deref() == Some(name)
+                    })).map(|loaded| loaded.config.clone())
+                })
+            } else {
+                None
+            };
+            let mut config = if let Some(config) = snapshot {
+                config
+            } else {
+                let model = model
+                    .or_else(|| host.base.model_id.clone())
+                    .or_else(|| host.base.model.file_name().map(|name| name.to_string_lossy().into_owned()))
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| invalid("model is required while no model is loaded; choose an installed name from /api/tags or /v1/models"))?;
+                let resolver = host.clone();
                 tokio::task::spawn_blocking(move || resident_config(resolve(resolver, model)?))
                     .await
                     .map_err(|e| invalid(e.to_string()))?
-                    .map_err(invalid)?;
+                    .map_err(invalid)?
+            };
+            // Validate the complete Ollama request against the proposed settings
+            // before dropping a working model or allocating a replacement.
+            if let Some(request) = &request {
+                request.apply(&mut config)?;
+            }
             // Reuse under a read lease so an equivalent selector also works while
             // another response still holds the resident model's lease.
             if let Ok(guard) = host.loaded.clone().try_read_owned()
@@ -710,14 +814,23 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
         body.as_object_mut().unwrap().remove("keep_alive");
     }
     // Ollama's empty generate request explicitly loads or unloads the chosen model.
-    if path == "/api/generate"
+    let load_only = path == "/api/generate"
         && body.get("prompt").is_none_or(|v| v == "")
-        && body.get("images").is_none()
-    {
+        && body
+            .get("images")
+            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty));
+    let ollama_request = matches!(path.as_str(), "/api/generate" | "/api/chat")
+        .then(|| OllamaRequest::new(&body, path == "/api/chat", load_only))
+        .transpose()?;
+    if load_only {
         if keep == Some(Duration::ZERO) {
+            let mut config = host.base.clone();
+            ollama_request.as_ref().unwrap().apply(&mut config)?;
             host.stop(model.as_deref()).await?;
         } else {
-            let lease = host.lease(model.clone()).await?;
+            let lease = host
+                .lease_ollama(model.clone(), ollama_request.unwrap())
+                .await?;
             drop(lease);
             let epoch = host.epoch.fetch_add(1, Ordering::SeqCst) + 1;
             host.expire(epoch, keep);
@@ -730,7 +843,11 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
             "tokenizer utilities use the current model; model selection is not supported in their request bodies",
         ));
     }
-    let lease = host.lease(model).await?;
+    let lease = if let Some(request) = ollama_request {
+        host.lease_ollama(model, request).await?
+    } else {
+        host.lease(model).await?
+    };
     let loaded = lease.as_ref().ok_or_else(|| invalid("no model loaded"))?;
     let id = loaded.config.model_id.clone().unwrap_or_else(|| {
         loaded
@@ -1186,6 +1303,189 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap()
     }
+    async fn fixture_ollama_lease(
+        host: &Host,
+        body: Value,
+        builds: Arc<AtomicU64>,
+    ) -> Result<Lease, ApiError> {
+        let model = body.get("model").and_then(Value::as_str).map(str::to_owned);
+        let request = OllamaRequest::new(&body, false, false)?;
+        host.lease_request_with(
+            model,
+            Some(request),
+            |_, _| panic!("the current model must use its loaded snapshot"),
+            move |config| async move {
+                builds.fetch_add(1, Ordering::SeqCst);
+                fake_app(config).await
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn ollama_context_resize_reuses_the_loaded_snapshot_and_then_the_worker() {
+        let host = fake_host().await;
+        let builds = Arc::new(AtomicU64::new(0));
+        let original = host.loaded.read().await.as_ref().unwrap().worker.id();
+        for model in [Some("fixture:latest"), None] {
+            let mut body = json!({"prompt":"hello", "options":{"num_ctx":8192,"num_predict":-1}});
+            if let Some(model) = model {
+                body["model"] = json!(model);
+            }
+            let lease = fixture_ollama_lease(&host, body, builds.clone())
+                .await
+                .unwrap();
+            let loaded = lease.as_ref().unwrap();
+            assert_eq!(loaded.config.context, 8192);
+            assert_ne!(loaded.worker.id(), original);
+            drop(lease);
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        let worker = host.loaded.read().await.as_ref().unwrap().worker.id();
+        let lease = fixture_ollama_lease(&host, json!({"prompt":"follow up"}), builds.clone())
+            .await
+            .unwrap();
+        assert_eq!(lease.as_ref().unwrap().config.context, 8192);
+        assert_eq!(lease.as_ref().unwrap().worker.id(), worker);
+        drop(lease);
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ollama_idle_selection_applies_context_before_the_first_build() {
+        let (_dir, config) = tokio::task::spawn_blocking(resident_fixture).await.unwrap();
+        let (app, host) = Host::new(ServeConfig::default()).await.unwrap();
+        let body = json!({"model":"fixture:latest","prompt":"hello","options":{"num_ctx":8192,"num_predict":-1}});
+        let lease = host
+            .lease_request_with(
+                Some("fixture:latest".into()),
+                Some(OllamaRequest::new(&body, false, false).unwrap()),
+                move |_, _| Ok(config),
+                |config| async move {
+                    assert_eq!(config.context, 8192);
+                    fake_app(config).await
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(lease.as_ref().unwrap().config.context, 8192);
+        drop(lease);
+        drop(app);
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_ollama_resize_never_unloads_a_working_model() {
+        let host = fake_host().await;
+        let builds = Arc::new(AtomicU64::new(0));
+        let original = host.loaded.read().await.as_ref().unwrap().worker.id();
+        for options in [
+            json!({"num_ctx":0}),
+            json!({"num_ctx":1}),
+            json!({"num_ctx":-1}),
+            json!({"num_ctx":2147483648u64}),
+            json!({"num_ctx":8192.0}),
+            json!({"num_ctx":null}),
+            json!({"num_ctx":"8192"}),
+            json!(null),
+            json!({"num_ctx":8192,"num_predict":0}),
+            json!({"num_ctx":8192,"num_predict":8193}),
+            json!({"num_ctx":8192,"temperature":3}),
+            json!({"num_ctx":8192,"top_p":0}),
+            json!({"num_ctx":8192,"unsupported":true}),
+        ] {
+            let body = json!({"prompt":"hello", "options":options});
+            let error = fixture_ollama_lease(&host, body, builds.clone())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                host.loaded.read().await.as_ref().unwrap().worker.id(),
+                original
+            );
+        }
+        for fields in [
+            json!({"think":true}),
+            json!({"format":"json"}),
+            json!({"prompt":null}),
+            json!({"stream":null}),
+            json!({"unexpected":true}),
+        ] {
+            let mut body = json!({"prompt":"hello", "options":{"num_ctx":8192}});
+            body.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let error = fixture_ollama_lease(&host, body, builds.clone())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            host.loaded.read().await.as_ref().unwrap().worker.id(),
+            original
+        );
+        let lease = host.lease(None).await.unwrap();
+        assert_eq!(
+            fixture_generation(&lease).await["choices"][0]["text"],
+            "hello"
+        );
+        drop(lease);
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ollama_context_resize_rejects_active_leases_without_teardown() {
+        let host = fake_host().await;
+        let held = host.lease(None).await.unwrap();
+        let worker = held.as_ref().unwrap().worker.id();
+        let builds = Arc::new(AtomicU64::new(0));
+        let error = fixture_ollama_lease(
+            &host,
+            json!({"prompt":"hello","options":{"num_ctx":8192}}),
+            builds.clone(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+        assert_eq!(held.as_ref().unwrap().worker.id(), worker);
+        assert_eq!(
+            fixture_generation(&held).await["choices"][0]["text"],
+            "hello"
+        );
+        drop(held);
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_empty_ollama_load_or_unload_does_not_touch_the_resident() {
+        let host = fake_host().await;
+        let worker = host.loaded.read().await.as_ref().unwrap().worker.id();
+        for keep in [json!(0), json!(-1)] {
+            for extra in [
+                json!({"unknown":true}),
+                json!({"options":{"num_ctx":1}}),
+                json!({"stream":null}),
+            ] {
+                let mut body = json!({"model":"fixture:latest","keep_alive":keep});
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let response = dispatch(State(host.clone()), request("/api/generate", body)).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    host.loaded.read().await.as_ref().unwrap().worker.id(),
+                    worker
+                );
+            }
+        }
+        host.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn idle_server_has_health_and_ps_without_initializing_a_model() {
         let (app, host) = Host::new(ServeConfig::default()).await.unwrap();

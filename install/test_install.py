@@ -69,6 +69,16 @@ class InstallerTests(unittest.TestCase):
             shutil.copy2(HERE / name, self.source / "install" / name)
         for name in ("Cargo.toml", "Cargo.lock", "desktop/Cargo.toml"):
             (self.source / name).write_text("fixture")
+        (self.source / "Cargo.toml").write_text('[package]\nname = "lma"\nversion = "1.2.3"\n\n[dependencies]\nother = "9.9.9"\n')
+        for name, content in (
+            ("LICENSE", "fixture lma license"),
+            ("vendor/llama-cpp-sys-2/llama.cpp/LICENSE", "fixture llama.cpp license"),
+            ("desktop/icons/icon.png", "fixture png"),
+            ("desktop/icons/icon.ico", "fixture ico"),
+        ):
+            path = self.source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
         for tool in (
             "cargo",
             "rustc",
@@ -90,6 +100,7 @@ class InstallerTests(unittest.TestCase):
             "XDG_DATA_HOME": str(self.home / "data"),
             "APPDATA": str(self.home / "roaming"),
             "LOCALAPPDATA": str(self.home / "local"),
+            "ProgramFiles": str(self.base / "Program Files"),
             "FAKE_LOG": str(self.log),
             "FAKE_SYSTEM": "Linux",
         }
@@ -306,7 +317,7 @@ class InstallerTests(unittest.TestCase):
         def without_webview(tool):
             return None if tool in ("pkg-config", "codesign") else original(tool)
         with patch.object(installer.shutil, "which", side_effect=without_webview):
-            for system in ("Linux", "Darwin", "Windows"):
+            for system in ("Linux", "Darwin", "Windows", "FreeBSD"):
                 with self.subTest(system=system):
                     if self.log.exists():
                         self.log.unlink()
@@ -480,6 +491,338 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "non-symlink"):
             self.invoke("--update")
         self.assertEqual(self.commands(), [])
+
+    def test_package_defaults_across_hosts_and_exact_inventory(self):
+        # Stale desktop artifacts and unrelated libraries must never leak into CLI packages.
+        release = self.source / "target/release"
+        release.mkdir(parents=True)
+        for name in ("lma-desktop", "lma-desktop.exe", "libllama.dylib", "random.dll"):
+            (release / name).write_text("stale")
+        original_source = {
+            p.relative_to(self.source): p.read_bytes()
+            for p in self.source.rglob("*") if p.is_file() and "target" not in p.relative_to(self.source).parts
+        }
+        for system in ("Linux", "Darwin", "FreeBSD", "Windows"):
+            with self.subTest(system=system):
+                if self.log.exists():
+                    self.log.unlink()
+                stage = self.base / ("package " + system)
+                self.invoke("--package-dir", str(stage), system=system)
+                root = stage / ("lma" if system == "Windows" else "usr" if system == "Linux" else "usr/local")
+                suffix = ".exe" if system == "Windows" else ""
+                self.assertEqual((root / ("bin/lma" + suffix)).read_text(), "new lma")
+                self.assertEqual((root / "share/lma/appicon.png").read_text(), "fixture png")
+                self.assertEqual((root / "share/lma/icon.ico").read_text(), "fixture ico")
+                self.assertEqual((root / "share/licenses/lma/LICENSE").read_text(), "fixture lma license")
+                self.assertEqual((root / "share/licenses/lma/llama.cpp/LICENSE").read_text(), "fixture llama.cpp license")
+                manifest = json.loads((root / "share/lma/package-manifest.json").read_text())
+                expected_prefix = str(Path(os.environ["ProgramFiles"]) / "lma") if system == "Windows" else "/usr" if system == "Linux" else "/usr/local"
+                self.assertEqual(manifest["prefix"], expected_prefix)
+                self.assertEqual(manifest["platform"], system)
+                self.assertEqual(manifest["version"], "1.2.3")
+                self.assertEqual(manifest["components"], ["cli"])
+                self.assertEqual(manifest["backend"], "metal" if system == "Darwin" else "cpu")
+                self.assertIs(manifest["source_registration"], False)
+                self.assertNotIn("source_dir", manifest)
+                self.assertIn("statically linked", manifest["runtime_libraries"])
+                actual = sorted(p.relative_to(stage).as_posix() for p in stage.rglob("*") if p.is_file())
+                expected = sorted((root / name).relative_to(stage).as_posix() for name in (
+                    "bin/lma" + suffix, "share/lma/appicon.png", "share/lma/icon.ico",
+                    "share/licenses/lma/LICENSE", "share/licenses/lma/llama.cpp/LICENSE",
+                    "share/lma/package-manifest.json",
+                ))
+                self.assertEqual(actual, expected)
+                self.assertEqual(manifest["files"], expected)
+                self.assertFalse(any(p.name in ("lib", "lma.app", installer.CONFIG_NAME) for p in stage.rglob("*")))
+                self.assertEqual(list(self.home.iterdir()), [])
+                builds = [c for c in self.commands() if c[0] == "cargo"]
+                self.assertEqual(builds, installer.build_commands(self.source, manifest["backend"], 2))
+                self.assertFalse(any(c[0] in ("ghx", "codesign", "pkg-config") for c in self.commands()))
+                self.assertFalse((self.source / "target/.source-install-lock").exists())
+        self.assertEqual(original_source, {
+            p.relative_to(self.source): p.read_bytes()
+            for p in self.source.rglob("*") if p.is_file() and "target" not in p.relative_to(self.source).parts
+        })
+
+    def test_package_desktop_is_plain_binary_on_every_supported_host(self):
+        (self.source / "install/Info.plist").unlink()
+        for system in ("Linux", "Darwin", "Windows"):
+            with self.subTest(system=system):
+                stage = self.base / ("desktop-package-" + system)
+                self.invoke("--package-dir", str(stage), "--desktop", system=system)
+                root = stage / ("lma" if system == "Windows" else "usr" if system == "Linux" else "usr/local")
+                suffix = ".exe" if system == "Windows" else ""
+                self.assertEqual((root / ("bin/lma-desktop" + suffix)).read_text(), "new lma-desktop")
+                self.assertEqual(json.loads((root / "share/lma/package-manifest.json").read_text())["components"], ["cli", "desktop"])
+                self.assertFalse(any(p.suffix in (".app", ".desktop") for p in stage.rglob("*")))
+                self.assertEqual(list(self.home.iterdir()), [])
+        self.assertFalse(any(c[0] == "codesign" for c in self.commands()))
+
+    def test_package_prefix_override_and_no_local_environment_dependency(self):
+        for system in ("Linux", "Darwin", "FreeBSD", "Windows"):
+            with self.subTest(system=system), patch.dict(os.environ, {"LOCALAPPDATA": "", "XDG_DATA_HOME": "relative", "ProgramFiles": ""}):
+                stage = self.base / ("custom-" + system)
+                prefix = self.base / "final tree/custom-lma"
+                self.invoke("--package-dir", str(stage), "--prefix", str(prefix), system=system)
+                root = stage / (prefix.name if system == "Windows" else prefix.relative_to(prefix.anchor))
+                suffix = ".exe" if system == "Windows" else ""
+                self.assertTrue((root / ("bin/lma" + suffix)).is_file())
+                self.assertFalse(prefix.exists())
+                self.assertEqual(json.loads((root / "share/lma/package-manifest.json").read_text())["prefix"], str(prefix))
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_package_windows_requires_program_files_only_for_default(self):
+        with patch.dict(os.environ, {"ProgramFiles": ""}):
+            with self.assertRaisesRegex(RuntimeError, "ProgramFiles must be set"):
+                self.invoke("--package-dir", str(self.base / "stage"), "--dry-run", system="Windows")
+        self.assertEqual(self.commands(), [])
+
+    def test_package_dry_run_missing_licenses_and_outputs_writes_nothing(self):
+        (self.source / "LICENSE").unlink()
+        (self.source / "vendor/llama-cpp-sys-2/llama.cpp/LICENSE").unlink()
+        (self.source / "desktop/icons/icon.png").unlink()
+        before = self.snapshot()
+        with patch.object(installer, "require_tools", side_effect=AssertionError("must not check tools")):
+            for system in ("Linux", "Darwin", "FreeBSD", "Windows"):
+                with self.subTest(system=system):
+                    self.output.seek(0)
+                    self.output.truncate()
+                    stage = self.base / ("dry-" + system)
+                    self.invoke("--package-dir", str(stage), "--dry-run", system=system)
+                    text = self.output.getvalue()
+                    root = stage / ("lma" if system == "Windows" else "usr" if system == "Linux" else "usr/local")
+                    self.assertIn(str(root / "share/licenses/lma/LICENSE"), text)
+                    self.assertIn(str(root / "share/licenses/lma/llama.cpp/LICENSE"), text)
+                    self.assertIn(str(root / "share/lma/appicon.png"), text)
+                    self.assertIn(str(root / "share/lma/package-manifest.json"), text)
+                    self.assertIn(str(root / ("bin/lma.exe" if system == "Windows" else "bin/lma")), text)
+                    self.assertIn("Defaults: CLI only; jobs: 2; backend:", text)
+                    self.assertIn("--locked --release --jobs 2", text)
+                    self.assertNotIn("lma-desktop", text)
+                    self.assertIn("No changes made", text)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(self.commands(), [])
+
+    def test_package_license_and_asset_requirements_fail_before_build(self):
+        for name in ("LICENSE", "vendor/llama-cpp-sys-2/llama.cpp/LICENSE", "desktop/icons/icon.png", "desktop/icons/icon.ico"):
+            file = self.source / name
+            content = file.read_bytes()
+            for kind in ("missing", "empty", "directory", "symlink"):
+                # The second inventoried image is optional, but must be safe if present.
+                if name.endswith("icon.ico") and kind == "missing":
+                    continue
+                with self.subTest(name=name, kind=kind):
+                    file.unlink()
+                    if kind == "empty":
+                        file.touch()
+                    elif kind == "directory":
+                        file.mkdir()
+                    elif kind == "symlink":
+                        file.symlink_to(self.source / "Cargo.toml")
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, "nonempty regular|symlink"):
+                            self.invoke("--package-dir", str(self.base / "bad-license"))
+                        self.assertFalse((self.base / "bad-license").exists())
+                        self.assertFalse((self.source / "target").exists())
+                        self.assertEqual(self.commands(), [])
+                    finally:
+                        installer.remove(file)
+                        file.write_bytes(content)
+
+    def test_package_optional_icon_absent_and_symlink_asset_parent(self):
+        (self.source / "desktop/icons/icon.ico").unlink()
+        stage = self.base / "one-icon"
+        self.invoke("--package-dir", str(stage))
+        self.assertFalse((stage / "usr/share/lma/icon.ico").exists())
+        icons = self.source / "desktop/icons"
+        moved = self.base / "moved-icons"
+        icons.rename(moved)
+        icons.symlink_to(moved, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.invoke("--package-dir", str(self.base / "linked-assets"))
+
+    def test_package_rejects_existing_unsafe_and_overlapping_destinations(self):
+        existing = self.base / "existing"
+        existing.mkdir()
+        (existing / "keep").write_text("untouched")
+        empty = self.base / "empty"
+        empty.mkdir()
+        file = self.base / "file"
+        file.write_text("keep file")
+        link = self.base / "link"
+        link.symlink_to(existing, target_is_directory=True)
+        dangling = self.base / "dangling"
+        dangling.symlink_to(self.base / "missing")
+        for destination in (
+            Path("relative"), self.base / ".." / "escape", Path("/"),
+            existing, empty, file, link, dangling, link / "new", dangling / "new",
+            self.source, self.source / "new", self.source / "target/new",
+            self.home, self.base, self.home / ".lma/new", self.base / "missing-parent/new",
+        ):
+            with self.subTest(destination=destination):
+                before = self.snapshot()
+                with self.assertRaises(RuntimeError):
+                    self.invoke("--package-dir", str(destination))
+                self.assertEqual(before, self.snapshot())
+        self.assertEqual((existing / "keep").read_text(), "untouched")
+        self.assertEqual(file.read_text(), "keep file")
+        self.assertEqual(self.commands(), [])
+
+    def test_package_prefix_validation_and_mode_conflicts(self):
+        link = self.base / "prefix-link"
+        link.symlink_to(self.base, target_is_directory=True)
+        file = self.base / "prefix-file"
+        file.write_text("not a directory")
+        for prefix in ("relative", "/", str(self.base / ".." / "escape"), str(link), str(link / "child"), str(file), str(file / "child")):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(RuntimeError, "--prefix"):
+                self.invoke("--package-dir", str(self.base / "stage"), "--prefix", prefix)
+        with self.assertRaisesRegex(RuntimeError, "only valid with --package-dir"):
+            self.invoke("--prefix", "/usr")
+        for args in (("--update",), ("--apply-staged",), ("--config-dir", str(self.home / "config"))):
+            with self.subTest(args=args), self.assertRaisesRegex(RuntimeError, "cannot be combined"):
+                self.invoke("--package-dir", str(self.base / "stage"), *args)
+        self.assertEqual(self.commands(), [])
+        self.assertFalse((self.source / "target").exists())
+
+    def test_package_failures_leave_local_install_and_package_parent_untouched(self):
+        self.invoke("--desktop")
+        home_before = {p.relative_to(self.home): p.read_bytes() for p in self.home.rglob("*") if p.is_file()}
+        stage = self.base / "failed-package"
+        original_copy = shutil.copy2
+
+        def fail_copy(source, destination, *args, **kwargs):
+            original_copy(source, destination, *args, **kwargs)
+            if Path(source).name == "icon.png":
+                raise OSError("injected copy failure")
+
+        for failure in ("build", "copy", "rename", "manifest"):
+            with self.subTest(failure=failure), contextlib.ExitStack() as stack:
+                if failure == "build":
+                    stack.enter_context(patch.dict(os.environ, {"FAKE_BUILD_FAIL": "lma-desktop"}))
+                elif failure == "copy":
+                    stack.enter_context(patch.object(installer.shutil, "copy2", side_effect=fail_copy))
+                elif failure == "rename":
+                    stack.enter_context(patch.object(installer.os, "rename", side_effect=OSError("injected rename failure")))
+                else:
+                    original_write = Path.write_text
+
+                    def fail_manifest(path, *args, **kwargs):
+                        if path.name == "package-manifest.json":
+                            raise OSError("injected manifest failure")
+                        return original_write(path, *args, **kwargs)
+
+                    stack.enter_context(patch.object(Path, "write_text", fail_manifest))
+                with self.assertRaises((OSError, RuntimeError)):
+                    self.invoke("--package-dir", str(stage), "--desktop")
+                self.assertFalse(stage.exists())
+                self.assertFalse(list(self.base.glob(".lma-package-*")))
+                self.assertFalse((self.source / "target/.source-install-lock").exists())
+                self.assertEqual(home_before, {p.relative_to(self.home): p.read_bytes() for p in self.home.rglob("*") if p.is_file()})
+
+    def test_package_destination_created_during_copy_is_not_replaced(self):
+        stage = self.base / "raced-package"
+        original = shutil.copy2
+
+        def create_destination(source, destination, *args, **kwargs):
+            if not stage.exists():
+                stage.mkdir()
+                (stage / "keep").write_text("other process")
+            return original(source, destination, *args, **kwargs)
+
+        with patch.object(installer.shutil, "copy2", side_effect=create_destination):
+            with self.assertRaisesRegex(RuntimeError, "must not exist"):
+                self.invoke("--package-dir", str(stage))
+        self.assertEqual((stage / "keep").read_text(), "other process")
+        self.assertFalse(list(self.base.glob(".lma-package-*")))
+
+    def test_package_does_not_read_or_modify_local_registration(self):
+        registration = self.home / ".lma/source-install.json"
+        registration.parent.mkdir()
+        registration.write_text("invalid local registration is irrelevant")
+        before = registration.read_bytes()
+        self.invoke("--package-dir", str(self.base / "unregistered"), system="Windows")
+        self.assertEqual(registration.read_bytes(), before)
+        self.assertEqual(list(self.home.rglob("*.json")), [registration])
+        self.assertFalse((self.home / "local").exists())
+
+    def test_package_target_symlink_and_active_lock_refused(self):
+        target = self.source / "target"
+        target.symlink_to(self.home, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.invoke("--package-dir", str(self.base / "stage"))
+        target.unlink()
+        lock = target / ".source-install-lock"
+        lock.mkdir(parents=True)
+        with self.assertRaisesRegex(RuntimeError, "Another installer"):
+            self.invoke("--package-dir", str(self.base / "stage"))
+        self.assertTrue(lock.exists())
+        self.assertEqual(self.commands(), [])
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_package_invalid_build_outputs_are_never_published(self):
+        original = installer.run
+        binary = self.source / "target/release/lma"
+        license_before = (self.source / "LICENSE").read_bytes()
+        for kind in ("missing", "empty", "symlink"):
+            def bad_output(command, cwd, capture=False):
+                result = original(command, cwd, capture)
+                if command[0] == "cargo":
+                    binary.unlink()
+                    if kind == "empty":
+                        binary.touch()
+                    elif kind == "symlink":
+                        binary.symlink_to(self.source / "LICENSE")
+                return result
+
+            with self.subTest(kind=kind), patch.object(installer, "run", side_effect=bad_output):
+                with self.assertRaisesRegex(RuntimeError, "nonempty regular|symlink"):
+                    self.invoke("--package-dir", str(self.base / "bad-output"))
+                self.assertFalse((self.base / "bad-output").exists())
+                self.assertFalse((self.source / "target/.source-install-lock").exists())
+                self.assertFalse(list(self.base.glob(".lma-package-*")))
+                self.assertEqual((self.source / "LICENSE").read_bytes(), license_before)
+                installer.remove(binary)
+
+    def test_package_preexisting_binary_symlink_refused_before_build(self):
+        binary = self.source / "target/release/lma"
+        binary.parent.mkdir(parents=True)
+        binary.symlink_to(self.source / "LICENSE")
+        before = (self.source / "LICENSE").read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.invoke("--package-dir", str(self.base / "stage"))
+        self.assertEqual(self.commands(), [])
+        self.assertEqual((self.source / "LICENSE").read_bytes(), before)
+
+    def test_package_desktop_dry_run_has_all_binary_destinations(self):
+        (self.source / "LICENSE").write_text("")
+        before = self.snapshot()
+        self.invoke("--package-dir", str(self.base / "desktop-preview"), "--desktop", "--dry-run", system="Darwin")
+        text = self.output.getvalue()
+        for name in ("lma", "lma-desktop"):
+            self.assertIn(str(self.base / "desktop-preview/usr/local/bin" / name), text)
+            self.assertIn(f"(final: /usr/local/bin/{name})", text)
+        self.assertNotIn("lma.app", text)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(self.commands(), [])
+        self.assertEqual((self.source / "LICENSE").read_bytes(), b"")
+
+    def test_package_source_case_alias_refused_when_filesystem_allows_it(self):
+        alias = self.source.with_name(self.source.name.upper())
+        if not alias.exists() or not alias.samefile(self.source):
+            self.skipTest("case-sensitive filesystem")
+        with self.assertRaisesRegex(RuntimeError, "overlaps protected"):
+            self.invoke("--package-dir", str(alias / "new-package"))
+        self.assertEqual(self.commands(), [])
+
+    def test_freebsd_is_experimental_cpu_cli_only_for_both_modes(self):
+        for mode in ([], ["--package-dir", str(self.base / "freebsd")]):
+            for options in (["--desktop"], ["--cuda"], ["--backend", "metal"]):
+                with self.subTest(mode=mode, options=options), self.assertRaisesRegex(RuntimeError, "CPU CLI only"):
+                    self.invoke(*mode, *options, system="FreeBSD")
+        self.assertEqual(self.commands(), [])
+        self.invoke(system="FreeBSD")
+        self.assertEqual((self.home / ".local/bin/lma").read_text(), "new lma")
+        self.assertIn("experimental", self.output.getvalue())
 
     def test_symlink_destination_refused(self):
         src, dest = self.base / "src", self.base / "dest"

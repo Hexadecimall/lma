@@ -67,6 +67,77 @@ runtime `lma s NAME -g cpu` to disable offload. With `--desktop`, macOS always
 enables Metal and rejects CPU/CUDA selection; use `--backend metal` if a saved
 CLI backend was CPU. Non-macOS Metal selection is invalid.
 
+## System-prefix package staging
+
+Normal source installations remain user-local and CLI-only by default. To prepare
+files for a system package **without installing them into protected directories**,
+use `--package-dir ABSOLUTE_PATH`. The output directory must not already exist;
+its parent must exist. `--prefix ABSOLUTE_PATH` overrides the final prefix and is
+valid only in package mode. These are installer flags, not root lma CLI flags.
+
+| Host    | Default final prefix                                     | Staged path beneath PACKAGE_DIR |
+| ------- | -------------------------------------------------------- | ------------------------------- |
+| Windows | `%ProgramFiles%\\lma` (usually `C:\\Program Files\\lma`) | `lma/bin/lma.exe`               |
+| Linux   | `/usr`                                                   | `usr/bin/lma`                   |
+| macOS   | `/usr/local`                                             | `usr/local/bin/lma`             |
+| FreeBSD | `/usr/local`                                             | `usr/local/bin/lma`             |
+
+Unix package roots mirror `/`. Windows package roots represent the final prefix's
+parent: a final `D:\\Apps\\lma` also stages as `lma/...`; the manifest records the
+full intended prefix. There is no cross-compilation or platform simulation flag.
+FreeBSD is **experimental CPU CLI only**; desktop, Metal and CUDA are rejected.
+User-local FreeBSD CLI installation uses `~/.local/bin/lma`.
+
+```sh
+# Choose a new output directory outside the source checkout; preview writes nothing.
+sh install/install.sh --package-dir /absolute/package-output --dry-run
+# Build and atomically publish that new package tree, after supplying a real license.
+sh install/install.sh --package-dir /absolute/package-output
+# Override final prefix; optional desktop remains a separate opt-in.
+sh install/install.sh --package-dir /absolute/another-output --prefix /opt/lma --desktop
+```
+
+PowerShell accepts the same arguments through `install/install.ps1`. No automatic
+elevation, system installation, PATH editing or package-manager registration is
+performed. Distribution packaging/installers must own privileged publication and
+runtime dependencies; do not run source builds as administrator/root merely to
+write a staging tree. This is **not** an MSI, deb/rpm, FreeBSD port or notarized
+macOS installer.
+
+Each final prefix contains:
+
+```text
+bin/lma[.exe]
+bin/lma-desktop[.exe]               # only with --desktop; plain binary, not .app
+share/lma/appicon.png
+share/lma/icon.ico                 # when present in the source inventory
+share/lma/package-manifest.json
+share/licenses/lma/LICENSE
+share/licenses/lma/llama.cpp/LICENSE
+```
+
+The manifest records version, host, backend, selected components, final prefix and
+file inventory. The currently inventoried images are PNG/ICO icons; no other named
+image directory is manufactured. The macOS release was inspected with `otool -L`:
+llama.cpp is statically linked and only system libraries/frameworks are required.
+No cosmetic `lib/llama.cpp` directory or arbitrary build-output libraries are
+copied. Future private dynamic libraries must be explicitly inventoried with
+loader paths and notices; CUDA/desktop host dependencies are not bundled here.
+
+Both license inputs and required assets must be nonempty regular non-symlink
+files. **The current root `LICENSE` is empty: actual package publication is blocked
+until the project owner supplies its license.** The installer never invents or
+overwrites it. Dry runs still work without assets, licenses or built binaries.
+This inventory is not a complete third-party license-compliance audit.
+
+Package mode never creates `~/.lma/source-install.json` or touches a local install.
+It cannot combine with `--update`, `--apply-staged` or `--config-dir`; system
+packages must be updated by their package manager, not the user-local source
+updater. Models/settings/caches remain per-user under `~/.lma`, not the system
+prefix. Traversal, symlink/reparse-point paths, existing outputs and protected
+source/state overlaps are rejected. Failed builds/copies/publication leave no
+completed package; the normal project `target/` build cache may still change.
+
 ## Prerequisites (install explicitly)
 
 - Python **3.9+**, available as `python3` on Unix or `python`/`python3` on Windows.
@@ -124,7 +195,7 @@ other build environment overrides are the caller's responsibility.
 
 With `--desktop`, Linux also gets
 `$XDG_DATA_HOME/applications/org.lma.app.desktop` (default
-`~/.local/share/applications`). With `--desktop`, macOS uses `install/Info.plist` for the 0.3.1
+`~/.local/share/applications`). With `--desktop`, macOS uses `install/Info.plist` for the 0.3.2
 `org.lma.app` bundle. If available, `codesign` ad-hoc signs and verifies it before
 publication. **This is a local build: not Developer ID signed or notarized.** The
 installer does not disable Gatekeeper or remove quarantine attributes. CLI-only

@@ -125,8 +125,12 @@ This does not add new weight formats or multimodal directives.
 - Raw completions and Ollama `raw:true` keep the exact prompt: no stored system,
   messages, or chat-template formatting. Sampling defaults still apply.
 - The CLI HTTP host applies the selected alias's definition when switching models;
-  explicit host load flags remain authoritative. Request `options.num_ctx` must
-  match the loaded context, not resize it.
+  explicit host load flags override stored load defaults. Managed Ollama generation
+  additionally honors request `options.num_ctx` as a per-resident context override:
+  a changed context safely reloads the model, while omission keeps its resident
+  context. Pinned desktop/in-process sessions still require matching context.
+  Ollama `num_predict:-1` uses remaining context; omission without a stored output
+  limit also uses remaining context. Other API families retain their own defaults.
 
 ## HTTP creation and frontend boundaries
 

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""User-local source builds. No network action other than explicit Cargo/ghx work."""
+"""User-local installs or isolated package roots built for the current host."""
 
 import argparse
 import json
 import os
 import platform
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -57,7 +59,7 @@ def locations(system, home, desktop=False):
         if desktop:
             paths["desktop"] = home / "Applications/lma.app"
         return home / ".lma", paths
-    if system == "Linux":
+    if system in ("Linux", "FreeBSD"):
         paths = {"cli": home / ".local/bin/lma"}
         if desktop:
             data = Path(os.environ.get("XDG_DATA_HOME") or home / ".local/share")
@@ -89,9 +91,9 @@ def require_tools(system, backend, update, desktop=False):
         tools["ghx"] = "Install ghx; updates require ghx remote list/status/pull."
     if system == "Darwin":
         tools["xcrun"] = "Install Xcode Command Line Tools: xcode-select --install."
-    elif system == "Linux":
+    elif system in ("Linux", "FreeBSD"):
         tools["cc"] = "Install a C/C++ build toolchain and libclang development packages."
-        if desktop:
+        if desktop and system == "Linux":
             tools["pkg-config"] = "Install pkg-config, WebKitGTK 4.1, GTK3 and librsvg development packages."
     if backend == "cuda":
         tools["nvcc"] = (
@@ -310,9 +312,208 @@ def package_and_install(source, system, config_dir, paths, config, apply_staged=
         shutil.rmtree(pending)
 
 
+def validate_selection(system, selected, jobs, desktop):
+    if system not in ("Linux", "Darwin", "FreeBSD", "Windows"):
+        raise RuntimeError(f"Unsupported OS: {system}")
+    if type(jobs) is not int or not 1 <= jobs <= 64:
+        raise RuntimeError("--jobs must be between 1 and 64 (default 2)")
+    if selected not in ("metal", "cpu", "cuda"):
+        raise RuntimeError("Invalid backend")
+    if system == "FreeBSD" and (desktop or selected != "cpu"):
+        raise RuntimeError("FreeBSD is experimental: CPU CLI only; no desktop or CUDA")
+    if (system == "Darwin" and desktop and selected != "metal") or (
+        system != "Darwin" and selected == "metal"
+    ):
+        raise RuntimeError(
+            "macOS desktop always enables Metal; use --backend metal with --desktop. "
+            "Metal is supported only on macOS."
+        )
+    if system == "FreeBSD":
+        print("WARNING: FreeBSD CPU CLI support is experimental.")
+
+
+def checked_absolute_path(path, label):
+    # Check before resolve(): resolution would conceal traversal and symlink parents.
+    if not path.is_absolute() or ".." in path.parts or any(
+        c in str(path) for c in "\x00\n\r"
+    ):
+        raise RuntimeError(f"{label} must be absolute and contain no traversal or control characters")
+    if path == Path(path.anchor):
+        raise RuntimeError(f"{label} must not be a filesystem root")
+    for part in (path, *path.parents):
+        if part.is_symlink():
+            raise RuntimeError(f"{label} must not contain symlinks: {part}")
+        try:
+            attributes = part.lstat()
+        except FileNotFoundError:
+            continue
+        except NotADirectoryError as error:
+            raise RuntimeError(f"{label} has a non-directory ancestor: {part}") from error
+        # Junctions and other Windows reparse points can redirect writes too.
+        if getattr(attributes, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RuntimeError(f"{label} must not contain reparse points: {part}")
+    return path
+
+
+def check_package_destination(destination, source, home):
+    checked_absolute_path(destination, "--package-dir")
+    for protected in (source.resolve(), home.resolve() / ".lma"):
+        overlaps = (destination == protected or protected in destination.parents
+                    or destination in protected.parents)
+        # Path comparisons alone miss case aliases on case-insensitive POSIX volumes.
+        if protected.exists():
+            overlaps = overlaps or any(
+                parent.exists() and parent.samefile(protected)
+                for parent in destination.parents
+            )
+        if overlaps:
+            raise RuntimeError(f"--package-dir overlaps protected path: {protected}")
+    if destination == home.resolve() or destination in home.resolve().parents:
+        raise RuntimeError("--package-dir must not be the home directory or its ancestor")
+    if destination.exists():
+        raise RuntimeError(f"--package-dir must not exist: {destination}")
+    if not destination.parent.is_dir():
+        raise RuntimeError("--package-dir parent must be an existing directory")
+
+
+def required_package_file(path):
+    checked_absolute_path(path, "Package input")
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"Package input must be a nonempty regular non-symlink file: {path}")
+
+
+def package_version(source):
+    # Python 3.9 has no tomllib; read only the literal [package] version, not dependencies.
+    text = (source / "Cargo.toml").read_text(encoding="utf-8")
+    package = re.search(r"(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)", text)
+    version = re.search(r'^version\s*=\s*"([^"\n]+)"\s*(?:#.*)?$',
+                        package.group(1), re.MULTILINE) if package else None
+    if not version:
+        raise RuntimeError("Cargo.toml must contain a literal [package] version for packaging")
+    return version.group(1)
+
+
+def stage_package(args, source, system, home):
+    """Build normally, but publish only a new package tree; never register or elevate."""
+    if args.update or args.apply_staged or args.config_dir is not None:
+        raise RuntimeError("--package-dir cannot be combined with --update, --apply-staged or --config-dir")
+    selected = args.backend or ("metal" if system == "Darwin" else "cpu")
+    jobs = args.jobs if args.jobs is not None else 2
+    validate_selection(system, selected, jobs, args.desktop)
+    destination = args.package_dir
+    check_package_destination(destination, source, home)
+    if args.prefix is not None:
+        prefix = args.prefix
+    elif system == "Windows":
+        if not os.environ.get("ProgramFiles"):
+            raise RuntimeError("ProgramFiles must be set for the default Windows package prefix")
+        program_files = Path(os.environ["ProgramFiles"])
+        checked_absolute_path(program_files, "ProgramFiles")
+        prefix = program_files / "lma"
+    else:
+        prefix = Path("/usr" if system == "Linux" else "/usr/local")
+    checked_absolute_path(prefix, "--prefix")
+    for part in (prefix, *prefix.parents):
+        if part.exists() and not part.is_dir():
+            raise RuntimeError(f"--prefix must name a directory, not an existing file: {part}")
+    # Windows package root represents prefix.parent, not a drive root or Program Files.
+    # Thus C:\\Program Files\\lma and D:\\Apps\\lma both stage as lma/bin/lma.exe.
+    root = Path(prefix.name) if system == "Windows" else prefix.relative_to(prefix.anchor)
+    suffix = ".exe" if system == "Windows" else ""
+    binaries = [(source / "target/release" / ("lma" + suffix), root / "bin" / ("lma" + suffix))]
+    if args.desktop:
+        binaries.append((source / "target/release" / ("lma-desktop" + suffix),
+                         root / "bin" / ("lma-desktop" + suffix)))
+    assets = [
+        (source / "desktop/icons/icon.png", root / "share/lma/appicon.png"),
+        (source / "LICENSE", root / "share/licenses/lma/LICENSE"),
+        (source / "vendor/llama-cpp-sys-2/llama.cpp/LICENSE",
+         root / "share/licenses/lma/llama.cpp/LICENSE"),
+    ]
+    # Preserve the other inventoried image by name; never glob arbitrary build assets.
+    icon = source / "desktop/icons/icon.ico"
+    if icon.exists() or icon.is_symlink():
+        assets.append((icon, root / "share/lma/icon.ico"))
+    manifest_path = root / "share/lma/package-manifest.json"
+    manifest = {
+        "schema_version": 1,
+        "prefix": str(prefix),
+        "platform": system,
+        "version": package_version(source),
+        "components": ["cli", "desktop"] if args.desktop else ["cli"],
+        "backend": selected,
+        "files": sorted(str(path.as_posix()) for path in [
+            *(path for _, path in binaries + assets), manifest_path,
+        ]),
+        "runtime_libraries": (
+            "llama.cpp is statically linked; no private runtime libraries are bundled "
+            "and no cosmetic lib directory is created. OS libraries/frameworks and "
+            "any selected CUDA or desktop runtime dependencies must be provided by the host."
+        ),
+        "source_registration": False,
+        "root_convention": (
+            "Package root represents the final prefix's parent; files start with prefix.name. "
+            "Drive and parent directories are not reproduced."
+            if system == "Windows" else "Package root represents /; final prefix is mirrored beneath it."
+        ),
+    }
+    commands = build_commands(source, selected, jobs, args.desktop)
+    print(f"Source: {source}\nPlatform: {system} (host only); backend: {selected}; jobs: {jobs}")
+    print(f"Package directory: {destination}\nFinal prefix: {prefix}")
+    print("Defaults: CLI only; jobs: 2; backend: " + ("metal" if system == "Darwin" else "cpu"))
+    print(manifest["root_convention"])
+    for _, relative in binaries + assets:
+        final = prefix / relative.relative_to(root)
+        print(f"Stage: {destination / relative} (final: {final})")
+    print(f"Manifest: {destination / manifest_path} (final: {prefix / 'share/lma/package-manifest.json'})")
+    print("No system installation, elevation or source registration; ~/.lma is not used.")
+    if args.dry_run:
+        for command in commands:
+            print("Would run: " + subprocess.list2cmdline(command))
+        print("Would require nonempty, regular, non-symlink licenses/assets and build outputs, "
+              "then atomically publish a fresh package root. No changes made.")
+        return
+    for file in [source / "Cargo.lock", *([source / "desktop/Cargo.toml"] if args.desktop else [])]:
+        if not file.is_file():
+            raise RuntimeError(f"Missing {file}; use a complete source checkout with committed lockfiles.")
+    for file, _ in assets:
+        required_package_file(file)
+    target = checked_absolute_path(source / "target", "Build cache")
+    checked_absolute_path(target / "release", "Build output directory")
+    for binary, _ in binaries:
+        checked_absolute_path(binary, "Build output")
+    require_tools(system, selected, False, args.desktop)
+    target.mkdir(exist_ok=True)
+    lock = target / ".source-install-lock"
+    try:
+        lock.mkdir()
+    except FileExistsError as error:
+        raise RuntimeError(f"Another installer is active. Verify no build is running before removing {lock}.") from error
+    try:
+        for command in commands:
+            run(command, source)
+        # Recheck after building, before creating any package output.
+        check_package_destination(destination, source, home)
+        for file, _ in binaries + assets:
+            required_package_file(file)
+        with tempfile.TemporaryDirectory(prefix=".lma-package-", dir=destination.parent) as temporary:
+            stage = Path(temporary)
+            for file, relative in binaries + assets:
+                output = stage / relative
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file, output)
+            (stage / manifest_path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            stage.chmod(0o755)
+            check_package_destination(destination, source, home)
+            os.rename(stage, destination)
+    finally:
+        lock.rmdir()
+    print(f"Completed package root: {destination}. No local installation or registration was changed.")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Build/install this checkout locally. Never installs toolchains."
+        description="Build/install this checkout locally, or stage a host package. Never installs toolchains."
     )
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--cpu", dest="backend", action="store_const", const="cpu")
@@ -343,9 +544,24 @@ def main(argv=None):
         type=Path,
         help="registration directory (default: ~/.lma)",
     )
+    parser.add_argument(
+        "--package-dir", type=Path, metavar="ABSOLUTE_PATH",
+        help="stage a fresh package root (must not exist; existing nonsymlink parent required); no registration/elevation",
+    )
+    parser.add_argument(
+        "--prefix", type=Path, metavar="ABSOLUTE_PATH",
+        help="final installation prefix, only with --package-dir; defaults: Linux /usr, macOS/FreeBSD /usr/local, "
+             "Windows ProgramFiles/lma. POSIX stages mirror /; Windows package root represents prefix.parent "
+             "(ProgramFiles/lma becomes PACKAGE_DIR/lma).",
+    )
     args = parser.parse_args(argv)
     source = Path(__file__).resolve().parent.parent
     system, home = platform.system(), Path.home()
+    if args.prefix is not None and args.package_dir is None:
+        raise RuntimeError("--prefix is only valid with --package-dir")
+    if args.package_dir is not None:
+        stage_package(args, source, system, home)
+        return
     config_dir, paths = locations(system, home)
     if args.config_dir:
         config_dir = args.config_dir
@@ -394,17 +610,7 @@ def main(argv=None):
         or ("metal" if system == "Darwin" else "cpu")
     )
     jobs = args.jobs if args.jobs is not None else (saved or {}).get("jobs", 2)
-    if type(jobs) is not int or not 1 <= jobs <= 64:
-        raise RuntimeError("--jobs must be between 1 and 64 (default 2)")
-    if selected not in ("metal", "cpu", "cuda"):
-        raise RuntimeError("Invalid backend")
-    if (system == "Darwin" and desktop and selected != "metal") or (
-        system != "Darwin" and selected == "metal"
-    ):
-        raise RuntimeError(
-            "macOS desktop always enables Metal; use --backend metal with --desktop. "
-            "Metal is supported only on macOS."
-        )
+    validate_selection(system, selected, jobs, desktop)
     manifests = [source / "Cargo.toml", source / "Cargo.lock"]
     if desktop:
         manifests.append(source / "desktop/Cargo.toml")

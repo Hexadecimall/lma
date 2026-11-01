@@ -1,6 +1,15 @@
 # Runtime performance
 
-The current engineering target is **2–3× Ollama throughput** on representative
+**Immediate release priority:** make the documented Ollama-compatible text path
+practical and establish at-least-Ollama performance before pursuing larger gains.
+Use normal GPU residency with expert caching off as the baseline; the cache's
+measured slowdown below is not an acceptable default speed tradeoff. Compatibility
+changes (remaining-context Ollama replies and safe per-request context reloads)
+do not themselves establish an inference speedup. Same-context requests keep their
+worker/prefix fast path; changed contexts pay a real reload cost. Universal
+throughput parity remains unverified.
+
+The longer-term engineering target is **2–3× Ollama throughput** on representative
 text workloads, with identical GGUF bytes, context, GPU placement and sampling.
 This replaces the earlier 1.4× target; **neither target is achieved or guaranteed**.
 Expert-cache priorities should improve reuse on repeated workloads, but learned
@@ -137,6 +146,38 @@ The native test suite, including shared readback reuse/offset coverage, passes
 **26/26**. This does not resolve the documented 2 GiB fusion-normalized real-model
 logit mismatch. The n-gram candidate-history helper is currently a **test-only
 prototype**, not integrated speculative decoding or a delivered speedup.
+
+## 0.3.2 replacement-baseline check — 2026-11-01
+
+A fresh sequential comparison used lma 0.3.2 and Ollama 0.40.12 on the Apple M5,
+the same installed Mellum GGUF referenced above, context 1024, four threads,
+batch/micro-batch 16, F16 KV, flash off and 29/29 GPU layers. **Expert caching was
+off.** Native logs confirmed placement/context/batching; no CPU fallback was used.
+Both engines used raw greedy requests, 64 output tokens and three repetitions of
+each independently primed warm-prefix workload. This was repeated with engine
+order reversed:
+
+| Workload       | Ollama first: Ollama / lma tokens/s | lma first: Ollama / lma tokens/s |
+| -------------- | ----------------------------------: | -------------------------------: |
+| Identical      |                     64.838 / 69.316 |                  66.616 / 70.109 |
+| Extended       |                     61.528 / 66.494 |                  66.376 / 68.391 |
+| Changed suffix |                     63.705 / 67.186 |                  66.321 / 69.337 |
+
+All **18 paired comparisons (36 measured responses)** matched output hashes,
+token counts and finish reasons. The measured client end-to-end advantage was
+**3.0–8.1% across the two orders**. This supports at-least-Ollama performance for
+this narrow baseline, not statistical significance, a new kernel speedup, or
+universal parity. It does not cover default batch/context settings, long/cold
+prompts, reasoning/chat/tool workflows, flash-on tuning, other models, or paging.
+Earlier experimental-cache performance/correctness limits remain unresolved.
+
+The same owned lma test host successfully loaded with `options.num_ctx:2048`,
+then reloaded to 1024 before benchmarking; `/api/ps` and native logs agreed.
+Only isolated test servers/children were started/stopped, one engine at a time;
+the user's existing Ollama service was neither reconfigured nor stopped. No
+weights were downloaded/copied. Scripts, native logs and JSON reports are local
+untracked artifacts under `target/ollama-baseline-032/` and
+`target/ollama-baseline-032-reverse/`.
 
 ## Reproducible HTTP comparison
 

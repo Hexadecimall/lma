@@ -360,6 +360,8 @@ pub struct FetchConfig {
     pub ollama_database: bool,
     pub lm_studio_database: bool,
     pub list: bool,
+    /// Maximum catalog rows to display; unrelated to selecting a download.
+    pub index: u32,
     pub file: Option<String>,
     pub output: PathBuf,
 }

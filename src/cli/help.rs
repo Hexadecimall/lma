@@ -94,7 +94,7 @@ COMMANDS
 │  ├─ s -p FILE          Select an explicit local GGUF
 │  └─ s -ct PRESET       Print connection settings; -a selects API routes
 ├─ q INPUT [OUTPUT]      Quantize GGUF        / nss quantize
-├─ f QUERY               Download GGUF        / nss fetch
+├─ f [QUERY]             Browse/download GGUF / nss fetch
 ├─ i DIR PROMPT          Local SD1.5 image    / nss image (alias: imagen)
 ├─ it                    Import supported safetensors / nss import
 ├─ ce NAME               Create a Modelfile profile / nss create NAME
@@ -113,7 +113,7 @@ EXAMPLES
   lma sp                     / lma nss stop
   lma s -p model.gguf -ct claude-code
   lma ce my-local -f ./Modelfile -d
-  lma f llama3.2 -l            / lma nss fetch llama3.2 --list
+  lma f -l -i 50              / lma nss fetch --list --index 50
 
 Root commands and flags use the first letter; collisions use first + last.
 No root aliases or long flags. Use `lma COMMAND -h`, `lma h s -a` for HTTP
@@ -829,7 +829,11 @@ OLLAMA SUBSET
   function definitions/calls/results use client-executed tools.
   /api/generate: prompt, optional system/images; raw:true keeps the exact prompt.
   stream defaults to TRUE (NDJSON); explicit false returns one JSON response.
-  options: num_predict, temperature, top_p, seed; num_ctx must match host context.
+  options: num_predict, temperature, top_p, seed, num_ctx.
+  num_predict:-1 uses remaining context; omission inherits a model limit if set,
+  otherwise has no reply cap. EOS/cancellation/context exhaustion still stop it.
+  Managed HTTP num_ctx resizes via a safe reload; unchanged context reuses the model.
+  Pinned desktop/in-process sessions still require num_ctx to match their context.
   Example: {\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}],\"stream\":false,\"options\":{\"num_predict\":64}}
   Returns model, created_at, content/tool calls, done/done_reason, engine token
   counts, and measured total_duration; no invented phase timings or VRAM stats.
@@ -901,26 +905,36 @@ pub(super) const FETCH: &str = "\
 lma f — find and download public GGUF models.
 
 USAGE
-  lma f QUERY [OPTIONS]
+  lma f [QUERY] [OPTIONS]
+  lma f -l                   # Top 50 by Hugging Face downloads; no weights fetched
+  lma f -l -i 20             # Show up to 20 repositories
   lma f llama3.2 -l
   lma f llama3.2 -oe
   lma f lmstudio-community/Qwen2.5-0.5B-Instruct-GGUF -le
 
 SOURCES
-  No source flags: combine both catalogs, with source labels.
+  With a query and no source flags: combine both catalogs, with source labels.
+  Without a query, -l lists popular public Hugging Face GGUF repositories by
+  reported downloads (default 50). This is not a merged Ollama/HF ranking.
   -oe      Only Ollama's registry (exact model[:tag] lookup)
   -le   Only public Hugging Face GGUF repositories,
                         the source used by LM Studio's downloader
   Both flags: combine both sources. Model weights are never merged.
 
 OPTIONS
-      -l            List candidates without downloading weights
+      -l            List candidates without downloading weights; QUERY optional
+      -i NUM        Maximum results to display (index/count; default 50; 1..1000)
+                    Does not select a model. NSS: --index NUM.
       -f NAME       Exact Hugging Face GGUF filename
   -o DIR                Download root (default: ~/.lma/models)
                         Independent of working directory. Use -o . explicitly.
                         Missing/relative HOME/USERPROFILE needs -o DIR.
       -d         Preview settings; no network or writes
   -h            This help (long help flags are NSS-only)
+
+A query is required to download. Catalog popularity does not prove architecture
+support, quality, or memory fit. -oe alone needs a query (no Ollama popularity API
+is used). Listing contacts catalog metadata only and never creates model files.
 
 Downloads require one unambiguous exact model/repository match; fuzzy search
 results are not downloaded automatically. On Hugging Face, -f wins;

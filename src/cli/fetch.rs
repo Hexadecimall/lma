@@ -14,6 +14,7 @@ pub(super) fn parse(mut args: Args) -> Result<Action, String> {
         ollama_database: false,
         lm_studio_database: false,
         list: false,
+        index: 50,
         file: None,
         output: PathBuf::new(),
     };
@@ -51,6 +52,14 @@ pub(super) fn parse(mut args: Args) -> Result<Action, String> {
                 flag.switch()?;
                 config.list = true;
             }
+            "--index" => {
+                config.index = args
+                    .text(&flag)?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| (1..=1000).contains(n))
+                    .ok_or("index must be an integer between 1 and 1000 (number of results)")?;
+            }
             "--file" => config.file = Some(args.text(&flag)?),
             "--output" | "--out" | "-o" => {
                 config.output = PathBuf::from(args.value(&flag)?);
@@ -70,11 +79,14 @@ pub(super) fn parse(mut args: Args) -> Result<Action, String> {
             }
         }
     }
-    config.query = query
-        .ok_or("fetch needs a model name or owner/repository; try `lma f llama3.2 -l`")?
-        .trim()
-        .to_owned();
-    if config.query.is_empty()
+    if query.is_none() && !config.list {
+        return Err(
+            "fetch needs a model name or owner/repository; use `lma f -l` to browse popular models"
+                .into(),
+        );
+    }
+    config.query = query.as_deref().unwrap_or("").trim().to_owned();
+    if (query.is_some() && config.query.is_empty())
         || config.query.len() > 512
         || config.query.chars().any(char::is_control)
     {
@@ -83,6 +95,12 @@ pub(super) fn parse(mut args: Args) -> Result<Action, String> {
     if !config.ollama_database && !config.lm_studio_database {
         config.ollama_database = true;
         config.lm_studio_database = true;
+    }
+    if config.query.is_empty() && !config.lm_studio_database {
+        return Err("popularity browsing uses Hugging Face download counts; -oe needs a model query (or add -le)".into());
+    }
+    if config.query.is_empty() && config.file.is_some() {
+        return Err("-f/--file needs a Hugging Face owner/repository query".into());
     }
     if config.file.is_some() && !config.lm_studio_database {
         return Err("--file selects a Hugging Face GGUF file; use --lm-studio-database".into());
@@ -185,6 +203,55 @@ mod tests {
             panic!()
         };
         assert!(config.ollama_database && !config.lm_studio_database);
+    }
+
+    #[test]
+    fn popularity_listing_needs_no_query_and_index_limits_rows() {
+        for argv in [
+            vec!["f", "-l", "-d"],
+            vec!["nss", "fetch", "--list", "--dry-run"],
+        ] {
+            let parsed = plan(&argv);
+            assert!(parsed.dry_run);
+            let Job::Fetch(config) = parsed.job else {
+                panic!()
+            };
+            assert!(config.list);
+            assert_eq!(config.query, "");
+            assert_eq!(config.index, 50);
+        }
+        for (argv, count) in [
+            (vec!["f", "-l", "-i", "1"], 1),
+            (vec!["f", "qwen", "-l", "-i=20"], 20),
+            (vec!["nss", "fetch", "--list", "--index", "1000"], 1000),
+        ] {
+            let Job::Fetch(config) = plan(&argv).job else {
+                panic!()
+            };
+            assert_eq!(config.index, count);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_index_and_ambiguous_popularity_sources() {
+        for argv in [
+            vec!["f", "-l", "-i", "0"],
+            vec!["f", "-l", "-i=-1"],
+            vec!["f", "-l", "-i", "1.5"],
+            vec!["f", "-l", "-i", "1001"],
+            vec!["f", "-l", "-i", "4294967296"],
+            vec!["f", "-l", "-i", "no"],
+            vec!["f", "-l", "-i"],
+            vec!["f", "-l", "-oe"],
+            vec!["f", "-l", "-f", "model.gguf"],
+            vec!["f", "  ", "-l"],
+            vec!["f", "--index", "2", "-l"],
+        ] {
+            assert!(
+                crate::cli::parse(argv.iter().map(OsString::from)).is_err(),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

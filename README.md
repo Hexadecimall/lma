@@ -306,6 +306,17 @@ lists installed models immediately with the default `all` profile (or `-a ollama
 `GET /v1/models` works with every profile, and `/api/ps` is empty until a model is
 loaded. The first generation request must include an installed `model` name;
 later requests can use the resident model. Nothing is downloaded implicitly.
+For an Ollama-compatible local listener, free port 11434 yourself and run
+`lma s -a ollama -pt 11434`; point the client at `http://127.0.0.1:11434`.
+No Ollama process is needed for compatible installed GGUF weights. This remains
+a documented protocol subset, not certification for every Ollama client.
+Managed `/api/chat` and `/api/generate` requests can now set `options.num_ctx`:
+changing it reloads safely, repeating it reuses the worker, and omitting it keeps
+the resident context. `num_predict:-1` means remaining context; omission uses a
+stored lma definition limit or otherwise has no reply cap. EOS and context limits
+still apply. Expert caching remains opt-in; no universal speed parity is claimed.
+See [Ollama API details and limits](docs/ollama-api.md).
+
 An explicit `NAME` preloads an installed model; root `-m NAME` also selects it. Use root `-p FILE` to explicitly select a local GGUF, including a file whose name collides with an installed model. Positional/`-m` file paths remain accepted; existing local files win. On actual startup, installed names (e.g. `llama3.2`) go through the shared installed-model resolver. Missing absolute, explicitly relative, or `.gguf` paths remain path errors; use `ollama:NAME` to disambiguate.
 
 - Select explicitly with root `-o NAME` or positional `ollama:llama3.2:latest`. `lma nss serve --ollama NAME` also works; NSS retains its legacy option shortcuts.
@@ -499,9 +510,12 @@ Only **one model operation runs at a time**; overlapping requests receive HTTP *
 
 ## Fetch GGUF models
 
-`lma f QUERY [OPTIONS]` (NSS `lma nss fetch`) combines **Ollama's registry and public Hugging Face GGUF repositories by default**, with source-labelled results. The latter is the LM Studio-compatible download source, not a separate proprietary LM Studio registry. Combining catalogs **does not merge model weights**.
+`lma f [QUERY] [OPTIONS]` (NSS `lma nss fetch`) combines **Ollama's registry and public Hugging Face GGUF repositories by default**, with source-labelled results. The latter is the LM Studio-compatible download source, not a separate proprietary LM Studio registry. Combining catalogs **does not merge model weights**.
 
 ```sh
+lma f -l                               # Top 50 public HF GGUF repositories by downloads
+lma f -l -i 20                         # Show up to 20; never downloads weights
+lma f qwen -l -i 10                    # Limit query results
 lma f llama3.2 -l
 lma f llama3.2 -oe
 lma f lmstudio-community/Qwen2.5-0.5B-Instruct-GGUF -le
@@ -509,17 +523,32 @@ lma f owner/repository -le -f model.Q4_K_M.gguf -o models
 lma f llama3.2 -d                        # No network or writes
 ```
 
-The table and long-option discussion in this section apply only to **`lma nss fetch`**. Root `lma f` uses `-l` (list), `-f NAME` (file), `-o DIR` (output), `-oe` (Ollama database), `-le` (LM Studio-compatible database), `-h` (help), and `-d` (dry-run).
+The table and long-option discussion in this section apply only to **`lma nss fetch`**. Root `lma f` uses `-l` (list), `-i NUM` (index/result count, default 50, 1–1000), `-f NAME` (file), `-o DIR` (output), `-oe` (Ollama database), `-le` (LM Studio-compatible database), `-h` (help), and `-d` (dry-run).
 
 | NSS option                    | Behavior                                                                                                   |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `--ollama-database`           | Only Ollama; exact `name[:tag]` or `namespace/name[:tag]` lookup (default tag `latest`).                   |
 | `--lm-studio-database`        | Only public Hugging Face GGUF repositories; searches names, requires exact `owner/repository` to download. |
 | Both source flags, or neither | Query both sources.                                                                                        |
-| `--list`                      | Discover/list candidates; network access, but no weight downloads.                                         |
+| `--index NUM`                 | Maximum displayed results (default 50; 1–1000), not a selected result number.                              |
+| `--list`                      | Discover/list candidates; omit QUERY to browse popularity; no weight downloads.                            |
 | `--file NAME`                 | Exact Hugging Face GGUF filename; otherwise prefer a unique Q4_K_M file, then a unique standalone GGUF.    |
 | `--output`, `--out`, `-o DIR` | Download root; default `~/.lma/models/`. Use `--out .` explicitly for the current directory.               |
 | `--dry-run`                   | Config preview only; no network or writes.                                                                 |
+
+With **no query**, `lma f -l` requests up to 50 public repositories tagged GGUF,
+ranked by Hugging Face's reported download counts; `-i NUM` changes the count.
+This is a repository ranking, not a ranking of individual quantizations, model
+quality, speed, or verified lma compatibility. Some catalog models may not be
+supported by the pinned runtime. Ollama counts are not mixed into this ranking;
+`-oe` alone needs a query. A query is always required to download. Listings use
+bounded catalog metadata and never download weights or create model directories.
+
+**Hugging Face support:** public compatible GGUF repositories can be downloaded
+and run directly; `-le` is the existing HF/LM Studio-compatible source selector.
+This does not mean arbitrary PyTorch/safetensors, private or gated repositories
+can be executed as chat models. Supported safetensors imports are explicit and
+architecture-specific; see [model support](docs/model-support.md).
 
 The default download root is the absolute home-based `~/.lma/models/`, independent of the working directory. Missing or relative `HOME` (`USERPROFILE` first on Windows) is an error unless `--out DIR` is explicit. `--out .` deliberately opts into the current directory; no implicit current-directory fallback occurs.
 

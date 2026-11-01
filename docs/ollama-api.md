@@ -38,6 +38,29 @@ credentials, or cloud model execution. `create` does not pretend to convert arbi
 safetensors: use `lma it -hr DIR -ot FILE.gguf` for supported profiles.
 Unsupported creation fields fail instead of being silently ignored.
 
+## Using lma in place of a local Ollama server
+
+Once port 11434 is free, start an idle native host:
+
+```sh
+lma s -a ollama -pt 11434
+curl http://127.0.0.1:11434/api/tags
+```
+
+Point an Ollama-compatible client at `http://127.0.0.1:11434` (not `/v1`).
+The client selects an installed model by name. Existing compatible Ollama GGUF
+blobs are read in place; no copy, download or Ollama daemon is needed. Use
+`-a all` instead if that same listener should also expose the other APIs.
+The installer does not stop Ollama, claim its port, or change client settings.
+
+The baseline uses normal model residency: expert caching is **off unless `-e` is
+explicitly supplied**, GPU offload is requested by default in GPU-enabled builds,
+and memory fallback is `error`, not automatic CPU retry. This is a supported API
+subset, not full Ollama replacement certification: unsupported model formats,
+custom Go templates, ignored Ollama profile layers, missing options and client
+requirements can still block a particular workflow. See [performance evidence](performance.md)
+for the scoped measurements; universal throughput parity has not been established.
+
 ## Loading, residency and stopping
 
 ```sh
@@ -169,11 +192,29 @@ record includes `done:true`, `done_reason`, engine token counts and measured
 disconnect cancels native delivery; admission remains held until decoding exits.
 Explicit `stream:false` returns one JSON object.
 
-Supported options: positive `num_predict`, `temperature` (0–2), `top_p` (0–1,
-exclusive of zero), unsigned `seed`, and `num_ctx` only when it matches configured
-host context. Unknown options fail. JSON/schema `format`, separate thinking
-control/output, unlimited token budgets and resizing context per request remain
-unsupported. `think:false` does not suppress a model's internal reasoning.
+Supported options: `num_predict` as a positive integer or **`-1`**,
+`temperature` (0–2), `top_p` (0–1, exclusive of zero), unsigned `seed`, and
+`num_ctx` (integer 2–2147483647). `num_predict:-1` removes the reply cap and uses
+remaining native context; EOS, cancellation and context exhaustion still stop
+execution. When omitted, `num_predict` inherits the selected lma definition's
+explicit limit, otherwise uses remaining context instead of the former 256-token
+fallback. Zero, null, fractional limits and historical `-2` fill-context mode fail.
+Positive limits remain bounded by the configured context.
+
+The **managed HTTP host** honors `options.num_ctx` on `/api/chat` and
+`/api/generate`, including empty-prompt load requests. A changed context reloads
+the selected model through the same exclusive lifecycle as a model switch; the
+old worker exits before the new one starts. This can incur model-load latency and
+a larger context can fail memory allocation. Native load failure can leave the
+host idle; no silent CPU fallback is enabled. Request context overrides the
+startup/default context for that resident; subsequent requests that omit it keep
+the resident context. Repeating the same context reuses the worker and prefix
+cache. Malformed resize requests are rejected before unloading the current model;
+active response leases return 409 rather than being interrupted. Pinned
+in-process/desktop sessions cannot resize and still require matching context.
+
+Unknown options fail. JSON/schema `format` and separate thinking control/output
+remain unsupported. `think:false` does not suppress a model's internal reasoning.
 
 For a selected lma definition, omitted sampling/output options inherit its
 `temperature`, `top_p`, `seed`, and `num_predict`; explicit request values win
@@ -182,8 +223,9 @@ For a selected lma definition, omitted sampling/output options inherit its
 system instructions override `SYSTEM` (`system:""` clears it in generate), not
 stored messages. `raw:true` applies no stored system/history/template formatting,
 but retains sampling defaults. Explicit host load flags override stored load and
-template defaults, also when switching models; request `num_ctx` cannot resize
-context. See [runtime precedence](modelfile.md#runtime-precedence).
+template defaults, also when switching models. The managed Ollama request's
+`num_ctx` is an explicit per-resident context override as described above.
+See [runtime precedence](modelfile.md#runtime-precedence).
 
 Images require a compatible GGUF and projector. PNG/JPEG only, at most eight
 images, 8 MiB per image and 16 MiB total; remote image URLs are not fetched.

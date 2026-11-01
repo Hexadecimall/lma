@@ -345,23 +345,26 @@ pub(super) fn default_top_p() -> f32 {
 
 impl AppState {
     pub(super) fn generation_defaults(&self) -> Options {
-        let parameters = self
-            .definition
-            .as_deref()
-            .map(|definition| &definition.parameters);
-        Options {
-            until_context: false,
-            max_tokens: parameters
-                .and_then(|p| p.num_predict)
-                .unwrap_or_else(default_max_tokens),
-            temperature: parameters
-                .and_then(|p| p.temperature)
-                .unwrap_or_else(default_temperature),
-            top_p: parameters
-                .and_then(|p| p.top_p)
-                .unwrap_or_else(default_top_p),
-            seed: parameters.and_then(|p| p.seed),
-        }
+        generation_defaults(self.definition.as_deref())
+    }
+}
+
+pub(super) fn generation_defaults(
+    definition: Option<&crate::models::modelfile::Definition>,
+) -> Options {
+    let parameters = definition.map(|definition| &definition.parameters);
+    Options {
+        until_context: false,
+        max_tokens: parameters
+            .and_then(|p| p.num_predict)
+            .unwrap_or_else(default_max_tokens),
+        temperature: parameters
+            .and_then(|p| p.temperature)
+            .unwrap_or_else(default_temperature),
+        top_p: parameters
+            .and_then(|p| p.top_p)
+            .unwrap_or_else(default_top_p),
+        seed: parameters.and_then(|p| p.seed),
     }
 }
 
@@ -2265,7 +2268,9 @@ mod tests {
             assert_eq!(requests[0].options.temperature, 0.2);
             assert_eq!(requests[0].options.top_p, 0.7);
             assert_eq!(requests[0].options.seed, Some(42));
-            assert_eq!(requests[1].options.max_tokens, default_max_tokens());
+            assert!(!requests[0].options.until_context);
+            assert!(requests[1].options.until_context);
+            assert_eq!(requests[1].options.max_tokens, 1024);
             assert_eq!(requests[1].options.temperature, default_temperature());
             assert_eq!(requests[1].options.top_p, default_top_p());
             assert_eq!(requests[1].options.seed, None);
@@ -2427,7 +2432,17 @@ mod tests {
             ("keep_alive", json!("5m")),
             ("options", json!({"unknown":true})),
             ("options", json!({"num_predict":0})),
-            ("options", json!({"num_predict":-1})),
+            ("options", json!({"num_predict":-2})),
+            ("options", json!({"num_predict":null})),
+            ("options", json!({"num_predict":-1.0})),
+            ("options", json!({"num_predict":-3})),
+            ("options", json!({"num_predict":4294967296u64})),
+            ("options", json!({"num_predict":1.5})),
+            ("options", json!({"num_predict":"-1"})),
+            ("options", json!({"num_predict":true})),
+            ("options", json!({"num_predict":[]})),
+            ("options", json!({"num_predict":{}})),
+            ("options", json!({"num_predict":-1,"temperature":2.1})),
             ("options", json!({"num_predict":1025})),
             ("options", json!({"temperature":2.1})),
             ("options", json!({"top_p":0})),

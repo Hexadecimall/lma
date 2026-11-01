@@ -25,7 +25,13 @@ use catalog::{Candidate, Catalog, Source};
 /// automatic download even when another source succeeds. No authentication is sent.
 pub fn run(config: FetchConfig) -> Result<(), String> {
     let query = config.query.trim();
-    if query.is_empty() || query.len() > 512 || query.chars().any(char::is_control) {
+    if !(1..=1000).contains(&config.index) {
+        return Err("index must be an integer between 1 and 1000 (number of results)".into());
+    }
+    if (!config.list && query.is_empty())
+        || query.len() > 512
+        || query.chars().any(char::is_control)
+    {
         return Err(
             "fetch requires a nonempty model query of at most 512 bytes without control characters"
                 .into(),
@@ -37,11 +43,33 @@ pub fn run(config: FetchConfig) -> Result<(), String> {
     let client = download::client()?;
     // The CLI already defaults to both; retain that behavior for direct callers.
     let both = !config.ollama_database && !config.lm_studio_database;
-    let catalog = catalog::discover(
+    if query.is_empty() {
+        if !config.lm_studio_database && !both {
+            return Err("popularity browsing uses Hugging Face download counts; Ollama-only listing needs a model query".into());
+        }
+        if config.file.is_some() {
+            return Err("a Hugging Face filename needs an owner/repository query".into());
+        }
+        let models = catalog::popular(&client, config.index)?;
+        println!("Popular public Hugging Face GGUF repositories — ranked by reported downloads.");
+        println!(
+            "Ollama has no comparable popularity ranking here. Catalog entries are not a runtime compatibility guarantee."
+        );
+        println!("RANK  DOWNLOADS  REPOSITORY");
+        for (index, model) in models.iter().enumerate() {
+            println!("{:>4}  {:>9}  {}", index + 1, model.downloads, model.id);
+        }
+        if models.is_empty() {
+            println!("No popular GGUF repositories returned by Hugging Face.");
+        }
+        return Ok(());
+    }
+    let catalog = catalog::discover_with_limit(
         &client,
         query,
         config.ollama_database || both,
         config.lm_studio_database || both,
+        config.index,
     );
     for warning in &catalog.warnings {
         eprintln!("Warning: {warning}");
@@ -52,7 +80,7 @@ pub fn run(config: FetchConfig) -> Result<(), String> {
             catalog.warnings.join("; ")
         ));
     }
-    print_choices(&catalog);
+    print_choices(&catalog, config.index);
     if config.list {
         return Ok(());
     }
@@ -139,13 +167,13 @@ pub(crate) fn pull_ollama(
     })
 }
 
-fn print_choices(catalog: &Catalog) {
+fn print_choices(catalog: &Catalog, limit: u32) {
     if catalog.candidates.is_empty() {
         println!(
             "No catalog matches. Ollama supports exact name[:tag] or namespace/name[:tag] lookups; the LM Studio source searches public Hugging Face GGUF repositories."
         );
     }
-    for candidate in &catalog.candidates {
+    for candidate in catalog.candidates.iter().take(limit as usize) {
         println!(
             "[{}] {}{} ({})",
             candidate.source.label(),
