@@ -6,8 +6,8 @@ use super::{
     help, unsupported,
 };
 use crate::config::{
-    ALL_GPU_LAYERS, CLIENT_PRESETS, Job, LaunchConfig, LaunchTarget, Plan, ServeConfig,
-    default_api_for_client,
+    ALL_GPU_LAYERS, API_PROFILES, CLIENT_PRESETS, Job, LaunchConfig, LaunchTarget, Plan,
+    ServeConfig, default_api_for_client,
 };
 
 pub(super) fn parse(mut args: Args, command: Command) -> Result<Action, String> {
@@ -198,11 +198,8 @@ pub(super) fn parse(mut args: Args, command: Command) -> Result<Action, String> 
             }
             "--api" => {
                 config.api = args.text(&flag)?;
-                if !matches!(
-                    config.api.as_str(),
-                    "all" | "openai" | "ollama" | "anthropic"
-                ) {
-                    return Err("--api must be all, openai, ollama, or anthropic".into());
+                if !API_PROFILES.contains(&config.api.as_str()) {
+                    return Err(format!("--api must be one of: {}", API_PROFILES.join(", ")));
                 }
                 explicit_api = true;
             }
@@ -231,11 +228,8 @@ pub(super) fn parse(mut args: Args, command: Command) -> Result<Action, String> 
             _ => return Err(unsupported(&flag.name)),
         }
     }
-    config.model = match model.filter(|path| !path.as_os_str().is_empty()) {
-        Some(model) => model,
-        None if allow_missing_model => PathBuf::new(),
-        None => return Err("serve needs an installed model NAME or file path; try `lma s llama3.2`, `lma s -p model.gguf`, or `lma nss serve --path model.gguf`".into()),
-    };
+    // Hosting without a model starts an idle API server; only chat/launch opens setup.
+    config.model = model.unwrap_or_default();
     if !explicit_api {
         config.api = default_api_for_client(&config.client).into();
     }
@@ -807,9 +801,50 @@ mod tests {
     }
 
     #[test]
+    fn api_profiles_validate_shared_choices_for_root_and_nss() {
+        for &api in API_PROFILES {
+            for argv in [
+                vec!["s", "missing.gguf", "-a", api, "-d"],
+                vec!["nss", "serve", "missing.gguf", "--api", api, "--dry-run"],
+            ] {
+                let Job::Serve(config) = plan(&argv).job else {
+                    panic!()
+                };
+                assert_eq!(config.api, api);
+            }
+        }
+        for api in ["bogus", "LLAMA", "native", "openai,ollama"] {
+            let error =
+                crate::cli::parse(["s", "missing.gguf", "-a", api, "-d"].map(OsString::from))
+                    .err()
+                    .expect("invalid API profile must fail");
+            assert!(error.contains(&API_PROFILES.join(", ")), "{error}");
+        }
+        assert!(
+            crate::cli::parse(["s", "missing.gguf", "--api", "llama", "-d"].map(OsString::from),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn serve_without_model_is_an_idle_host_not_interactive_setup() {
+        for argv in [
+            vec!["s"],
+            vec!["s", "-or", "missing-store"],
+            vec!["nss", "serve"],
+            vec!["nss", "server", "--api", "ollama"],
+        ] {
+            let Job::Serve(config) = plan(&argv).job else {
+                panic!("expected idle host")
+            };
+            assert!(config.model.as_os_str().is_empty());
+            assert!(config.model_id.is_none());
+        }
+    }
+
+    #[test]
     fn invalid_or_unimplemented_options_are_errors() {
         for argv in [
-            vec!["nss", "serve"],
             vec!["nss", "serve", "m", "--context", "0"],
             vec!["nss", "serve", "m", "--port", "65536"],
             vec!["nss", "serve", "m", "--threads", "0"],

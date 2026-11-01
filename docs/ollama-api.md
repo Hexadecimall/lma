@@ -1,7 +1,7 @@
 # Ollama-compatible API
 
-The CLI HTTP host now discovers installed models and loads the model named by a
-request. It keeps **one resident model at a time**, not one process per model.
+`lma s` starts the CLI HTTP host **without requiring or loading a model**.
+It discovers installed models and loads the model named by a request. It keeps **one resident model at a time**, not one process per model.
 Desktop/TUI in-process sessions remain explicitly selected single-model sessions.
 This is an implemented protocol subset, not complete Ollama parity.
 
@@ -41,6 +41,9 @@ Unsupported creation fields fail instead of being silently ignored.
 ## Loading, residency and stopping
 
 ```sh
+lma s                         # Idle host on 127.0.0.1:8080; no inference initialization
+curl http://127.0.0.1:8080/api/tags  # Installed catalog without loading a model
+# Optional: preload a model instead of starting idle
 lma s -p /models/model.gguf -pt 8080
 lma sp                      # unload from the local host on port 8080
 lma nss stop --port 8080
@@ -49,8 +52,12 @@ lma nss stop --port 8080
 API model selection is restricted to the installed catalog and the host's
 explicit startup model. It is not an arbitrary filesystem-open endpoint. Duplicate
 names prefer the lma catalog entry for generation. Source-specific catalog IDs
-can disambiguate selection. Initial native loading happens before the host is
-ready. Switching preflights the next model before unloading the old worker, but
+can disambiguate selection. Without a startup model, `/health` reports
+`loaded:false`, `/api/ps` returns `{"models":[]}`, and `/api/tags` is available
+immediately (with `all`/`ollama`). The first generation or explicit load request
+must include `model`; omission while idle returns HTTP 400 and never picks a
+model arbitrarily. With an explicit startup model, initial native loading happens
+before the host is ready. Switching preflights the next model before unloading the old worker, but
 a native allocation/load failure after teardown can leave the host unloaded.
 The listener remains available for subsequent selections.
 

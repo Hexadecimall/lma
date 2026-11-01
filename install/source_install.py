@@ -51,33 +51,35 @@ def verify_update(source):
         )
 
 
-def locations(system, home):
+def locations(system, home, desktop=False):
     if system == "Darwin":
-        return home / ".lma", {
-            "cli": home / ".local/bin/lma",
-            "desktop": home / "Applications/lma.app",
-        }
+        paths = {"cli": home / ".local/bin/lma"}
+        if desktop:
+            paths["desktop"] = home / "Applications/lma.app"
+        return home / ".lma", paths
     if system == "Linux":
-        data = Path(os.environ.get("XDG_DATA_HOME") or home / ".local/share")
-        if not data.is_absolute():
-            raise RuntimeError("XDG_DATA_HOME must be an absolute path")
-        return home / ".lma", {
-            "cli": home / ".local/bin/lma",
-            "desktop": home / ".local/bin/lma-desktop",
-            "desktop_entry": data / "applications/org.lma.app.desktop",
-        }
+        paths = {"cli": home / ".local/bin/lma"}
+        if desktop:
+            data = Path(os.environ.get("XDG_DATA_HOME") or home / ".local/share")
+            if not data.is_absolute():
+                raise RuntimeError("XDG_DATA_HOME must be an absolute path")
+            paths.update({
+                "desktop": home / ".local/bin/lma-desktop",
+                "desktop_entry": data / "applications/org.lma.app.desktop",
+            })
+        return home / ".lma", paths
     if system == "Windows":
         if not os.environ.get("LOCALAPPDATA"):
             raise RuntimeError("LOCALAPPDATA must be set")
         root = Path(os.environ["LOCALAPPDATA"]) / "lma"
-        return home / ".lma", {
-            "cli": root / "bin/lma.exe",
-            "desktop": root / "bin/lma-desktop.exe",
-        }
+        paths = {"cli": root / "bin/lma.exe"}
+        if desktop:
+            paths["desktop"] = root / "bin/lma-desktop.exe"
+        return home / ".lma", paths
     raise RuntimeError(f"Unsupported OS: {system}")
 
 
-def require_tools(system, backend, update):
+def require_tools(system, backend, update, desktop=False):
     tools = {
         "cargo": "Install stable Rust with rustup explicitly (rustup.rs).",
         "rustc": "Install stable Rust with rustup explicitly (rustup.rs).",
@@ -88,12 +90,9 @@ def require_tools(system, backend, update):
     if system == "Darwin":
         tools["xcrun"] = "Install Xcode Command Line Tools: xcode-select --install."
     elif system == "Linux":
-        tools.update(
-            {
-                "pkg-config": "Install pkg-config, a C/C++ compiler, libclang, WebKitGTK 4.1, GTK3 and librsvg development packages.",
-                "cc": "Install a C/C++ build toolchain and libclang development packages.",
-            }
-        )
+        tools["cc"] = "Install a C/C++ build toolchain and libclang development packages."
+        if desktop:
+            tools["pkg-config"] = "Install pkg-config, WebKitGTK 4.1, GTK3 and librsvg development packages."
     if backend == "cuda":
         tools["nvcc"] = (
             "Install a compatible NVIDIA CUDA toolkit and driver; put nvcc on PATH."
@@ -104,13 +103,14 @@ def require_tools(system, backend, update):
     if system == "Darwin":
         try:
             run(["xcrun", "--find", "clang"], Path.cwd(), capture=True)
-            run(["xcrun", "--find", "metal"], Path.cwd(), capture=True)
+            if backend == "metal" or desktop:
+                run(["xcrun", "--find", "metal"], Path.cwd(), capture=True)
         except RuntimeError as error:
             raise RuntimeError(
                 "Xcode C/Metal tools unavailable. Install/select Xcode and its Metal toolchain; "
                 "Command Line Tools alone may not include Metal. " + str(error)
             ) from error
-    if system == "Linux":
+    if system == "Linux" and desktop:
         try:
             run(
                 ["pkg-config", "--exists", "webkit2gtk-4.1", "gtk+-3.0", "librsvg-2.0"],
@@ -125,12 +125,13 @@ def require_tools(system, backend, update):
             ) from error
     if system == "Windows":
         print(
-            "Requires Visual Studio C++ Build Tools, Windows SDK, LLVM/libclang and WebView2. "
-            "Use a Developer PowerShell if your tools are not on PATH."
+            "Requires Visual Studio C++ Build Tools, Windows SDK and LLVM/libclang. "
+            + ("Desktop also requires WebView2. " if desktop else "")
+            + "Use a Developer PowerShell if your tools are not on PATH."
         )
 
 
-def build_commands(source, backend, jobs):
+def build_commands(source, backend, jobs, desktop=False):
     common = [
         "--locked",
         "--release",
@@ -154,6 +155,8 @@ def build_commands(source, backend, jobs):
         "--features",
         core_features,
     ] + common
+    if not desktop:
+        return [cli]
     desktop = [
         "cargo",
         "build",
@@ -257,11 +260,12 @@ def package_and_install(source, system, config_dir, paths, config, apply_staged=
         package = Path(temporary)
         suffix = ".exe" if system == "Windows" else ""
         cli, desktop = release / ("lma" + suffix), release / ("lma-desktop" + suffix)
-        for binary in (cli, desktop):
+        binaries = [cli, desktop] if config.get("desktop", True) else [cli]
+        for binary in binaries:
             if not binary.is_file() or binary.is_symlink():
                 raise RuntimeError(f"Build output missing or symlinked: {binary}")
         items = [(cli, paths["cli"])]
-        if system == "Darwin":
+        if config.get("desktop", True) and system == "Darwin":
             app = package / "lma.app"
             (app / "Contents/MacOS").mkdir(parents=True)
             shutil.copy2(desktop, app / "Contents/MacOS/lma-desktop")
@@ -274,9 +278,9 @@ def package_and_install(source, system, config_dir, paths, config, apply_staged=
                     "WARNING: codesign unavailable; bundle is unsigned. This is a local, non-notarized build."
                 )
             items.append((app, paths["desktop"]))
-        else:
+        elif config.get("desktop", True):
             items.append((desktop, paths["desktop"]))
-        if system == "Linux":
+        if config.get("desktop", True) and system == "Linux":
             entry = package / "org.lma.app.desktop"
             entry.write_text(desktop_entry(paths["desktop"]), encoding="utf-8")
             items.append((entry, paths["desktop_entry"]))
@@ -292,15 +296,15 @@ def package_and_install(source, system, config_dir, paths, config, apply_staged=
             pending.mkdir(parents=True, exist_ok=True)
             publish(
                 [
-                    (cli, pending / cli.name),
-                    (desktop, pending / desktop.name),
+                    *((binary, pending / binary.name) for binary in binaries),
                     (registration, pending / CONFIG_NAME),
                 ]
             )
             raise RuntimeError(
                 f"Installation was rolled back: {error}. New binaries staged in {pending}. "
-                "Close lma and lma-desktop, then run install/install.ps1 --apply-staged "
-                "from this checkout. Restart the app manually."
+                + ("Close lma and lma-desktop" if config.get("desktop", True) else "Close lma")
+                + ", then run install/install.ps1 --apply-staged from this checkout "
+                "without overrides. Restart manually."
             ) from error
     if system == "Windows" and pending.exists():
         shutil.rmtree(pending)
@@ -315,6 +319,10 @@ def main(argv=None):
     backend.add_argument("--cuda", dest="backend", action="store_const", const="cuda")
     backend.add_argument("--backend", choices=["cpu", "metal", "cuda"])
     parser.add_argument("--jobs", type=int, default=None)
+    parser.add_argument(
+        "--desktop", action="store_true",
+        help="also build/install desktop (default: CLI only, including updates)",
+    )
     parser.add_argument(
         "--update",
         action="store_true",
@@ -347,9 +355,11 @@ def main(argv=None):
         raise RuntimeError(
             "--apply-staged is Windows-only and cannot be combined with --update"
         )
-    if args.apply_staged and (args.backend is not None or args.jobs is not None):
+    if args.apply_staged and (
+        args.backend is not None or args.jobs is not None or args.desktop
+    ):
         raise RuntimeError(
-            "--apply-staged uses the staged backend/jobs; do not override them"
+            "--apply-staged uses staged components/backend/jobs; do not override them"
         )
     saved = None
     saved_path = config_dir / CONFIG_NAME
@@ -371,8 +381,13 @@ def main(argv=None):
             raise RuntimeError(
                 "Registration does not belong to this source checkout/schema"
             )
+        if "desktop" in saved and type(saved["desktop"]) is not bool:
+            raise RuntimeError("Registration desktop must be a boolean")
     if args.apply_staged and saved is None:
         raise RuntimeError("No staged update found")
+    # Normal runs never inherit desktop opt-in; staged runs must preserve their set.
+    desktop = saved.get("desktop", True) if args.apply_staged else args.desktop
+    _, paths = locations(system, home, desktop)
     selected = (
         args.backend
         or (saved or {}).get("backend")
@@ -383,17 +398,17 @@ def main(argv=None):
         raise RuntimeError("--jobs must be between 1 and 64 (default 2)")
     if selected not in ("metal", "cpu", "cuda"):
         raise RuntimeError("Invalid backend")
-    if (system == "Darwin" and selected != "metal") or (
+    if (system == "Darwin" and desktop and selected != "metal") or (
         system != "Darwin" and selected == "metal"
     ):
         raise RuntimeError(
-            "macOS desktop always enables Metal; use the Metal default on macOS. CPU/CUDA are supported on Linux/Windows."
+            "macOS desktop always enables Metal; use --backend metal with --desktop. "
+            "Metal is supported only on macOS."
         )
-    for file in (
-        source / "Cargo.toml",
-        source / "Cargo.lock",
-        source / "desktop/Cargo.toml",
-    ):
+    manifests = [source / "Cargo.toml", source / "Cargo.lock"]
+    if desktop:
+        manifests.append(source / "desktop/Cargo.toml")
+    for file in [] if args.apply_staged else manifests:
         if not file.is_file():
             raise RuntimeError(
                 f"Missing {file}; use a complete source checkout with committed lockfiles."
@@ -403,9 +418,10 @@ def main(argv=None):
         "source_dir": str(source),
         "backend": selected,
         "jobs": jobs,
+        "desktop": desktop,
         "install_locations": {key: str(value) for key, value in paths.items()},
     }
-    commands = build_commands(source, selected, jobs)
+    commands = [] if args.apply_staged else build_commands(source, selected, jobs, desktop)
     print(
         f"Source: {source}\nBackend: {selected}; jobs: {jobs}; shared cache: {source / 'target'}"
     )
@@ -423,7 +439,7 @@ def main(argv=None):
         )
         return
     if not args.apply_staged:
-        require_tools(system, selected, args.update)
+        require_tools(system, selected, args.update, desktop)
     target = source / "target"
     target.mkdir(exist_ok=True)
     lock = target / ".source-install-lock"
@@ -445,11 +461,14 @@ def main(argv=None):
         )
     finally:
         lock.rmdir()
-    print("Completed. Restart the desktop app manually to use the new build.")
+    print("Completed. " + (
+        "Restart the desktop app manually to use the new build."
+        if desktop else "CLI installed; existing desktop installations were left unchanged."
+    ))
     print(
         f"CLI PATH: add {paths['cli'].parent} to your user PATH if it is not already present."
     )
-    if system == "Darwin":
+    if system == "Darwin" and desktop:
         print(
             "Local source build: ad-hoc signed if codesign is available; NOT Developer ID signed or notarized."
         )

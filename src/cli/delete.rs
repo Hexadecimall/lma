@@ -43,6 +43,11 @@ SAFETY AND OUTPUT
   to the existing deletion API. Use -s/--source to disambiguate sources; a store
   directory alone does not select a source. Ambiguous matches are refused.
   A registry alias may be removed without deleting shared or external weights.
+  Physical deletion also cleans lma aliases to removed primary weights, not aliases
+  to retained shared blobs or imported GGUF outputs. Discovery never prunes aliases.
+  To remove an already-missing target's alias, select lma:NAME:TAG with source lma.
+  aliasDeleted describes the selected alias; deletedAliases lists all removed
+  registrations. Check registryCleanupComplete and warnings for metadata failures.
   Dry-run prints the Plan: an argument preview, NOT a resolved file list or a
   guarantee that the selected model exists or is deletable. Success prints the
   existing deletion result as pretty JSON. Nothing is downloaded or queried

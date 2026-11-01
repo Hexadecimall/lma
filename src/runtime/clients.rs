@@ -33,25 +33,40 @@ pub fn setup(config: &ServeConfig, address: SocketAddr) -> String {
     });
     let openai = matches!(config.api.as_str(), "all" | "openai");
     let anthropic = matches!(config.api.as_str(), "all" | "anthropic");
-    let mut result = if openai {
-        format!("Chat in your browser: {root}/\nOpenAI base URL: {root}/v1")
-    } else if anthropic {
-        format!("Anthropic base URL: {root} (POST /v1/messages)")
-    } else {
-        format!("Ollama chat URL: {root}/api/chat")
-    };
-    if config.api == "all" {
-        result.push_str(&format!(
-            "\nAnthropic base URL: {root} (POST /v1/messages)\nOllama chat URL: {root}/api/chat"
+    let mut hints = Vec::new();
+    if openai {
+        hints.push(format!(
+            "Chat in your browser: {root}/\nOpenAI base URL: {root}/v1"
         ));
     }
-    result.push_str(&format!("\nModel ID: {}", quoted(&model)));
+    if anthropic {
+        hints.push(format!("Anthropic base URL: {root} (POST /v1/messages)"));
+    }
+    if matches!(config.api.as_str(), "all" | "ollama") {
+        hints.push(format!("Ollama chat URL: {root}/api/chat"));
+    }
+    if matches!(config.api.as_str(), "all" | "llama") {
+        hints.push(format!("llama base URL: {root} (POST /completion)"));
+    }
+    if matches!(config.api.as_str(), "all" | "lma") {
+        hints.push(format!("Native lma base URL: {root}/lma/v1"));
+    }
+    let mut result = hints.join("\n");
+    if model.is_empty() {
+        result.push_str("\nNo model loaded. Discover installed models at /v1/models (or /api/tags with all/ollama), then send model in the first request.");
+    } else {
+        result.push_str(&format!("\nModel ID: {}", quoted(&model)));
+    }
     result.push_str(if config.api_key.is_some() {
         "\nAuthentication: set your configured API key locally; it is never printed here."
     } else {
         "\nAuthentication: not required by this server."
     });
-    result.push_str("\nCompatibility: native text SSE; constrained/buffered tool args; client-executed tools; model-dependent, not full client parity.");
+    result.push_str(match config.api.as_str() {
+        "llama" => "\nCompatibility: strict llama-server subset; text SSE; no slots, FIM, cache_prompt, or stop controls. See docs/endpoints.md.",
+        "lma" => "\nCompatibility: native lma v1 JSON/NDJSON; no tools or remote image fetching. See docs/endpoints.md.",
+        _ => "\nCompatibility: native text SSE; constrained/buffered tool args; client-executed tools; model-dependent, not full client parity.",
+    });
 
     let family = default_api_for_client(&config.client);
     if family == "all" {
@@ -62,6 +77,11 @@ pub fn setup(config: &ServeConfig, address: SocketAddr) -> String {
             "\nSelected client preset's API family is disabled by -a (NSS: --api); no usable client profile emitted. Enable {family}/all for {}.",
             config.client
         ));
+        return result;
+    }
+
+    if model.is_empty() {
+        result.push_str("\nClient preset needs a model ID; select an installed model in your client or rerun with an explicit startup model for a model-specific snippet.");
         return result;
     }
 
@@ -211,6 +231,22 @@ mod tests {
     }
 
     #[test]
+    fn idle_settings_advertise_discovery_without_emitting_an_empty_model_preset() {
+        for client in ["default", "codex", "opencode"] {
+            let output = setup(
+                &ServeConfig {
+                    client: client.into(),
+                    ..Default::default()
+                },
+                "127.0.0.1:8080".parse().unwrap(),
+            );
+            assert!(output.contains("No model loaded"));
+            assert!(output.contains("/api/tags"));
+            assert!(!output.contains("Model ID: \"\""));
+            assert!(!output.contains("```"));
+        }
+    }
+    #[test]
     fn default_settings_keep_capabilities_concise_without_dumping_presets() {
         for client in ["default", "custom"] {
             let config = ServeConfig {
@@ -225,7 +261,42 @@ mod tests {
             assert_eq!(capabilities.len(), 1);
             assert!(capabilities[0].len() < 170);
             assert!(capabilities[0].contains("client-executed tools"));
-            assert!(output.lines().count() <= 8);
+            assert!(output.lines().count() <= 10);
+            assert!(!output.contains("```"));
+        }
+    }
+
+    #[test]
+    fn endpoint_hints_follow_profiles_without_inventing_client_compatibility() {
+        for &api in crate::config::API_PROFILES {
+            let config = ServeConfig {
+                api: api.into(),
+                ..ServeConfig::default()
+            };
+            let output = setup(&config, "0.0.0.0:8082".parse().unwrap());
+            for (family, hint) in [
+                ("openai", "OpenAI base URL: http://127.0.0.1:8082/v1"),
+                ("ollama", "Ollama chat URL: http://127.0.0.1:8082/api/chat"),
+                (
+                    "anthropic",
+                    "Anthropic base URL: http://127.0.0.1:8082 (POST /v1/messages)",
+                ),
+                (
+                    "llama",
+                    "llama base URL: http://127.0.0.1:8082 (POST /completion)",
+                ),
+                ("lma", "Native lma base URL: http://127.0.0.1:8082/lma/v1"),
+            ] {
+                assert_eq!(
+                    output.contains(hint),
+                    api == "all" || api == family,
+                    "{api}: {output}"
+                );
+            }
+            assert_eq!(
+                output.contains("Chat in your browser:"),
+                matches!(api, "all" | "openai")
+            );
             assert!(!output.contains("```"));
         }
     }
@@ -288,11 +359,10 @@ mod tests {
                 assert!(!output.contains('\u{7f}'));
                 config.api = "all".into();
                 assert!(!setup(&config, address).contains("no usable client profile"));
-                for disabled in if client == "claude-code" {
-                    ["openai", "ollama"]
-                } else {
-                    ["anthropic", "ollama"]
-                } {
+                for &disabled in crate::config::API_PROFILES
+                    .iter()
+                    .filter(|&&api| api != "all" && api != default_api_for_client(client))
+                {
                     config.api = disabled.into();
                     let gated = setup(&config, address);
                     assert!(gated.contains("no usable client profile"));
@@ -312,6 +382,7 @@ mod tests {
     fn zed_uses_current_openai_compatible_provider_not_acp() {
         let config = ServeConfig {
             client: "zed".into(),
+            model_id: Some("fixture.gguf".into()),
             context: 8192,
             ..ServeConfig::default()
         };
@@ -357,6 +428,7 @@ mod tests {
     fn codex_uses_user_level_responses_without_websockets_or_compression() {
         let config = ServeConfig {
             client: "codex".into(),
+            model_id: Some("fixture.gguf".into()),
             ..ServeConfig::default()
         };
         let output = setup(&config, "127.0.0.1:8080".parse().unwrap());
@@ -400,6 +472,7 @@ mod tests {
     fn vscode_is_continue_yaml_with_bounded_chat_not_universal_vscode() {
         let config = ServeConfig {
             client: "vscode".into(),
+            model_id: Some("fixture.gguf".into()),
             context: 2,
             ..ServeConfig::default()
         };

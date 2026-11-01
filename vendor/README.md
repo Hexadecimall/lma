@@ -46,6 +46,12 @@ but not >16-token CPU fallback operations. The application saves counts, not tex
 User documentation: [expert caching](../docs/expert-cache.md). Native design and
 test instructions: [backend notes](llama-cpp-sys-2/llama.cpp/docs/expert-cache.md).
 
+The vocabulary wrapper additionally exposes fixed-capacity tokenization and
+whole-sequence detokenization for HTTP utilities. Oversized native output is
+rejected without an allocation retry; token IDs are checked before native calls,
+and replacement-expanded UTF-8 is bounded before allocation. These utilities
+share worker admission without changing generation KV/history.
+
 When updating upstream:
 
 1. Review and rebase each local patch rather than replacing only one crate.

@@ -2296,7 +2296,7 @@ fn root_help_is_a_local_versioned_command_tree() {
         "├─ lh [NAME]",
         "├─ c [NAME]",
         "├─ t [OPTIONS]",
-        "├─ s NAME",
+        "├─ s [NAME]",
         "├─ sp [-m NAME]",
         "│  ├─ s -p FILE",
         "│  └─ s -ct PRESET",
@@ -2515,6 +2515,115 @@ fn terminal_help_documents_final_keys_slashes_and_attachment_limits() {
 }
 
 #[test]
+fn api_profiles_preview_without_models_and_reject_invalid_or_root_long_flags() {
+    let temp = TempDir::new();
+    assert_eq!(
+        lma::config::API_PROFILES,
+        ["all", "openai", "ollama", "llama", "lma", "anthropic"]
+    );
+    for &profile in lma::config::API_PROFILES {
+        for args in [
+            vec!["s", "missing.gguf", "-a", profile, "-d"],
+            vec![
+                "nss",
+                "serve",
+                "missing.gguf",
+                "--api",
+                profile,
+                "--dry-run",
+            ],
+        ] {
+            let output = isolated_lma(&temp).args(&args).output().unwrap();
+            assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+            let preview: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+            assert_eq!(preview["options"]["api"], profile);
+        }
+    }
+    for profile in ["bogus", "LLAMA", "native", "openai,ollama"] {
+        for args in [
+            vec!["s", "missing.gguf", "-a", profile, "-d"],
+            vec![
+                "nss",
+                "serve",
+                "missing.gguf",
+                "--api",
+                profile,
+                "--dry-run",
+            ],
+        ] {
+            let output = isolated_lma(&temp).args(&args).output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(stderr(&output).contains("all, openai, ollama, llama, lma, anthropic"));
+        }
+    }
+    for args in [
+        vec!["s", "missing.gguf", "--api", "llama", "-d"],
+        vec!["s", "missing.gguf", "--api=lma", "-d"],
+        vec!["s", "missing.gguf", "--", "--api", "lma", "-d"],
+    ] {
+        let output = isolated_lma(&temp).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
+    assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 0);
+}
+
+#[test]
+fn api_profiles_help_describes_endpoint_subsets_and_shared_controls() {
+    for args in [vec!["h", "s"], vec!["nss", "serve", "--help"]] {
+        let output = lma().env("PATH", "").args(args).output().unwrap();
+        assert!(output.status.success());
+        let help = stdout(&output);
+        for expected in [
+            "all|openai|ollama|llama|lma|anthropic",
+            "API info JSON",
+            "same in-process engine",
+            "docs/endpoints.md",
+        ] {
+            assert!(help.contains(expected), "missing {expected}: {help}");
+        }
+    }
+    let output = lma()
+        .env("PATH", "")
+        .args(["h", "s", "-a"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = stdout(&output);
+    for expected in [
+        "/props",
+        "/completion",
+        "/tokenize",
+        "/detokenize",
+        "/lma/v1/status",
+        "/lma/v1/generate",
+        "/lma/v1/chat",
+        "/health and /v1/models remain shared",
+        "/api/stop is shared host control",
+        "n_predict:positive|-1",
+        "cache_prompt",
+        "stop controls are rejected",
+        "actual token IDs/model vocabulary",
+        "add_special/parse_special booleans (default false)",
+        "max_tokens?:positive|null",
+        "explicit null means remaining context/no reply cap",
+        "Zero/negative max_tokens are rejected",
+        "api_version:1",
+        "eos|token_limit|context_limit",
+        "NDJSON start/delta/done/error",
+        "without aggregate text",
+        "1 MiB",
+        "24 MiB",
+        "Authorization: Bearer KEY",
+        "Streaming host leases last until body done",
+        "unknown names/filepaths",
+        "not full llama-server or cloud parity",
+        "no performance claim",
+    ] {
+        assert!(help.contains(expected), "missing {expected}: {help}");
+    }
+}
+
+#[test]
 fn client_presets_default_api_but_explicit_api_wins_in_either_order() {
     for prefix in [
         vec!["nss", "serve"],
@@ -2540,7 +2649,7 @@ fn client_presets_default_api_but_explicit_api_wins_in_either_order() {
             let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
             assert_eq!(json["options"]["client"], client);
             assert_eq!(json["options"]["api"], expected_api);
-            for api in ["all", "openai", "ollama", "anthropic"] {
+            for &api in lma::config::API_PROFILES {
                 for flags in [
                     vec!["--api", api, "--client", client],
                     vec!["--client", client, "--api", api],
@@ -2646,11 +2755,19 @@ fn printed_client_profiles_escape_config_hide_auth_and_gate_disabled_apis() {
                 _ => unreachable!(),
             }
             assert!(output.contains("end-to-end compatibility is not verified"));
-            config.api = "ollama".into();
-            let gated = setup(&config, address);
-            assert!(gated.contains("no usable client profile emitted"));
-            assert!(!gated.contains("```"));
-            assert!(!gated.contains("do-not-print-this-key"));
+            for &api in lma::config::API_PROFILES
+                .iter()
+                .filter(|&&api| api != "all" && api != lma::config::default_api_for_client(client))
+            {
+                config.api = api.into();
+                let gated = setup(&config, address);
+                assert!(
+                    gated.contains("no usable client profile emitted"),
+                    "{client}/{api}"
+                );
+                assert!(!gated.contains("```"));
+                assert!(!gated.contains("do-not-print-this-key"));
+            }
         }
     }
 }
@@ -2953,22 +3070,162 @@ fn launch_target_help_documents_choices_desktop_gates_and_long_nss_examples() {
 }
 
 #[test]
-fn serve_still_requires_a_model_and_invalid_launch_profiles_are_explicit_errors() {
-    for prefix in [
-        vec!["nss", "serve"],
-        vec!["nss", "server"],
-        vec!["nss", "serve"],
-    ] {
-        let output = lma().args(prefix).arg("--dry-run").output().unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        assert!(stderr(&output).contains("serve needs an installed model NAME or file path"));
+fn model_free_server_lists_ollama_tags_without_loading_weights_or_needing_a_tty() {
+    use std::{
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    struct Server(Option<std::process::Child>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
+    let temp = TempDir::new();
+    let local = temp.0.join("models");
+    let store = temp.0.join("ollama");
+    let manifests = store.join("manifests/registry.ollama.ai/library/idle");
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&manifests).unwrap();
+    fs::create_dir_all(store.join("blobs")).unwrap();
+    fs::write(local.join("local.gguf"), b"GGUFfixture").unwrap();
+    let digest = "a".repeat(64);
+    fs::write(store.join(format!("blobs/sha256-{digest}")), b"GGUFfixture").unwrap();
+    fs::write(manifests.join("latest"),serde_json::json!({"schemaVersion":2,"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":format!("sha256:{digest}"),"size":11}]}).to_string()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let child = isolated_lma(&temp)
+        .env_clear()
+        .env("PATH", "")
+        .env("HOME", temp.0.join("home"))
+        .env("USERPROFILE", temp.0.join("home"))
+        .env("OLLAMA_MODELS", &store)
+        .args(["s", "-ht", "127.0.0.1", "-pt"])
+        .arg(port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = Server(Some(child));
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let root = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Ok(response) = client.get(format!("{root}/health")).send()
+            && response.status().is_success()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle server did not become ready"
+        );
+        assert!(
+            server.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "idle server exited before becoming ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let health: serde_json::Value = client
+        .get(format!("{root}/health"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(health["loaded"], false);
+    let tags: serde_json::Value = client
+        .get(format!("{root}/api/tags"))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    let models = tags["models"].as_array().unwrap();
+    assert_eq!(models.len(), 2, "{tags}");
+    assert!(
+        models
+            .iter()
+            .any(|m| m["name"] == "idle:latest" && m["size"] == 11)
+    );
+    assert!(models.iter().any(|m| m["name"] == "local.gguf"));
+    let listed: serde_json::Value = client
+        .get(format!("{root}/v1/models"))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(listed["data"].as_array().unwrap().len(), 2);
+    for body in [
+        serde_json::json!({"prompt":"hi","stream":false}),
+        serde_json::json!({"model":"not-installed","prompt":"hi","stream":false}),
+    ] {
+        let response = client
+            .post(format!("{root}/api/generate"))
+            .json(&body)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let ps: serde_json::Value = client
+        .get(format!("{root}/api/ps"))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(ps, serde_json::json!({"models":[]}));
+    let mut child = server.0.take().unwrap();
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !stderr(&output).contains("Backend request:"),
+        "idle hosting must never initialize inference"
+    );
+    assert!(!stderr(&output).contains("Loading model"));
+}
+
+#[test]
+fn serve_allows_an_idle_host_and_invalid_launch_profiles_are_explicit_errors() {
+    let temp = TempDir::new();
+    for argv in [
+        vec!["s", "-d"],
+        vec!["s", "-or", "missing-store", "-d"],
+        vec!["nss", "serve", "--dry-run"],
+        vec!["nss", "server", "--api", "ollama", "--dry-run"],
+    ] {
+        let output = isolated_lma(&temp)
+            .env_clear()
+            .env("PATH", "")
+            .args(argv)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(plan["command"], "serve");
+        assert_eq!(plan["options"]["model"], "");
+        assert!(plan["options"].get("interactive").is_none());
+        assert!(stderr(&output).is_empty());
+    }
+    assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 0);
     for command in ["serve", "launch", "chat"] {
         for (flag, value, expected) in [
             (
                 "--api",
                 "bogus",
-                "--api must be all, openai, ollama, or anthropic",
+                "--api must be one of: all, openai, ollama, llama, lma, anthropic",
             ),
             (
                 "--client",

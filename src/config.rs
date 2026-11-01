@@ -140,6 +140,9 @@ impl Default for StopConfig {
     }
 }
 
+/// HTTP endpoint profiles; `all` enables every adapter family.
+pub const API_PROFILES: &[&str] = &["all", "openai", "ollama", "llama", "lma", "anthropic"];
+
 /// Formatting choices supported by the pinned llama.cpp renderer, plus lma's
 /// automatic policy, unified Gemma4 formatter, and plain-text base-model fallback.
 pub const CHAT_TEMPLATES: &[&str] = &[
@@ -439,6 +442,19 @@ fn redact_key<S: Serializer>(key: &Option<String>, serializer: S) -> Result<S::O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_profiles_preserve_default_and_existing_client_families() {
+        assert_eq!(
+            API_PROFILES,
+            ["all", "openai", "ollama", "llama", "lma", "anthropic"]
+        );
+        assert_eq!(ServeConfig::default().api, "all");
+        for &client in CLIENT_PRESETS {
+            assert!(API_PROFILES.contains(&default_api_for_client(client)));
+        }
+        assert_eq!(default_api_for_client("claude-code"), "anthropic");
+    }
 
     #[test]
     fn launch_targets_round_trip_serialize_and_map_to_client_presets() {

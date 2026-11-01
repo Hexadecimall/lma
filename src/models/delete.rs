@@ -384,17 +384,16 @@ fn run_with(
         ));
     }
     let selected = found[0];
+    let references = registry_references(&context)?;
     match &selected.kind {
-        Kind::Ollama { root, label } => delete_ollama(selected, root, label, warnings),
+        Kind::Ollama { root, label } => delete_ollama(selected, root, label, &references, warnings),
         Kind::Local { path } => {
             let files = local_files(path, selected.source, &context)?;
-            if selected.source == "lma" && shared_aliases(&context, &files, None, &mut warnings) {
-                return Err("local weights are referenced by registry aliases; delete the selected lma alias instead".into());
-            }
             let mut paths = files.clone();
             paths.extend(receipts(&files, &mut warnings));
             let staged = Staged::new(paths)?;
-            let (deleted, bytes) = staged.commit(&mut warnings);
+            let (deleted, bytes, unlinked) = staged.commit(&mut warnings);
+            let cleanup = cleanup_registry(&references, &files, &unlinked, &mut warnings);
             Ok(result(
                 selected,
                 deleted,
@@ -402,17 +401,20 @@ fn run_with(
                 Vec::new(),
                 false,
                 None,
+                cleanup,
                 warnings,
             ))
         }
         Kind::Alias { root, label, entry } => {
             let mut retained = Vec::new();
+            let mut assets = Vec::new();
             let staged = registry::remove_with(root, label, entry, |_| {
-                let canonical = fs::canonicalize(&entry.path).ok();
-                let Some(path) = canonical else {
-                    warnings
-                        .push("alias target is missing; removed only the registry alias".into());
-                    return Staged::new(Vec::new());
+                let path = match fs::canonicalize(&entry.path) {
+                    Ok(path) => path,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Staged::new(Vec::new());
+                    }
+                    Err(e) => return Err(format!("cannot resolve alias target: {e}")),
                 };
                 // A registry alias does not confer ownership of arbitrary external
                 // files, LM Studio assets, or blobs in an Ollama store.
@@ -434,11 +436,18 @@ fn run_with(
                 }
                 let mut paths = files.clone();
                 paths.extend(receipts(&files, &mut warnings));
+                assets = files;
                 Staged::new(paths)
             })?;
-            let (deleted, bytes) = staged.commit(&mut warnings);
+            let (deleted, bytes, unlinked) = staged.commit(&mut warnings);
+            let cleanup = cleanup_registry(&references, &assets, &unlinked, &mut warnings);
+            let obsolete = format!(
+                "registered model '{label}' is missing at '{}':",
+                entry.path.display()
+            );
+            warnings.retain(|warning| !warning.starts_with(&obsolete));
             Ok(result(
-                selected, deleted, bytes, retained, true, None, warnings,
+                selected, deleted, bytes, retained, true, None, cleanup, warnings,
             ))
         }
     }
@@ -450,9 +459,84 @@ fn result(
     retained: Vec<PathBuf>,
     alias: bool,
     gc: Option<bool>,
+    mut cleanup: RegistryCleanup,
     warnings: Vec<String>,
 ) -> Value {
-    json!({"status":"success","model":selected.label,"source":selected.source,"aliasDeleted":alias,"deletedFiles":deleted,"deletedBytes":bytes,"retainedFiles":retained,"blobGcComplete":gc,"warnings":warnings})
+    if alias {
+        if let Kind::Alias { root, label, .. } = &selected.kind {
+            cleanup.deleted.push(deleted_alias(root, label));
+        }
+    }
+    json!({"status":"success","model":selected.label,"source":selected.source,"aliasDeleted":alias,"deletedAliases":cleanup.deleted,"registryCleanupComplete":cleanup.complete,"deletedFiles":deleted,"deletedBytes":bytes,"retainedFiles":retained,"blobGcComplete":gc,"warnings":warnings})
+}
+
+type RegistryReferences = BTreeMap<PathBuf, BTreeMap<String, (registry::Entry, PathBuf)>>;
+
+fn registry_references(context: &Context) -> Result<RegistryReferences, String> {
+    let mut references = BTreeMap::new();
+    let mut count = 0;
+    for root in &context.registry_roots {
+        let mut targets = BTreeMap::new();
+        for (label, entry) in registry::read(root)? {
+            count += 1;
+            if count > MAX_REFS {
+                return Err("registry reference snapshot limit exceeded".into());
+            }
+            match fs::canonicalize(&entry.path) {
+                Ok(target) => {
+                    targets.insert(label, (entry, target));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot snapshot registry target: {e}")),
+            }
+        }
+        references.insert(root.clone(), targets);
+    }
+    Ok(references)
+}
+
+struct RegistryCleanup {
+    deleted: Vec<Value>,
+    complete: bool,
+}
+fn deleted_alias(root: &Path, label: &str) -> Value {
+    json!({"root":root,"alias":label,"id":format!("lma:{label}")})
+}
+fn cleanup_registry(
+    references: &RegistryReferences,
+    assets: &[PathBuf],
+    unlinked: &[PathBuf],
+    warnings: &mut Vec<String>,
+) -> RegistryCleanup {
+    let unlinked: BTreeSet<_> = unlinked.iter().collect();
+    let removed: BTreeSet<_> = assets.iter().filter(|p| unlinked.contains(p)).collect();
+    let mut cleanup = RegistryCleanup {
+        deleted: Vec::new(),
+        complete: true,
+    };
+    for (root, entries) in references {
+        let expected = entries
+            .iter()
+            .filter(|(_, (_, target))| removed.contains(target))
+            .map(|(label, reference)| (label.clone(), reference.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if expected.is_empty() {
+            continue;
+        }
+        match registry::remove_missing(root, &expected) {
+            Ok(labels) => cleanup
+                .deleted
+                .extend(labels.iter().map(|label| deleted_alias(root, label))),
+            Err(e) => {
+                cleanup.complete = false;
+                warnings.push(format!(
+                    "model files were deleted, but registry cleanup is incomplete at {}: {e}",
+                    root.display()
+                ));
+            }
+        }
+    }
+    cleanup
 }
 
 fn local_files(path: &Path, source: &str, context: &Context) -> Result<Vec<PathBuf>, String> {
@@ -762,6 +846,7 @@ fn delete_ollama(
     selected: &Candidate,
     root: &Path,
     label: &str,
+    registry_refs: &RegistryReferences,
     mut warnings: Vec<String>,
 ) -> Result<Value, String> {
     let (resolved_root, path, normalized) = models::import_source(label, Some(root))?;
@@ -807,10 +892,12 @@ fn delete_ollama(
             (Vec::new(), Vec::new(), false)
         }
     };
+    let assets = files.clone();
     // Hide the selected manifest before its blobs; rollback restores it last.
     files.insert(0, path);
     let staged = Staged::new(files)?;
-    let (deleted, bytes) = staged.commit(&mut warnings);
+    let (deleted, bytes, unlinked) = staged.commit(&mut warnings);
+    let cleanup = cleanup_registry(registry_refs, &assets, &unlinked, &mut warnings);
     Ok(result(
         selected,
         deleted,
@@ -818,6 +905,7 @@ fn delete_ollama(
         retained,
         false,
         Some(complete),
+        cleanup,
         warnings,
     ))
 }
@@ -871,8 +959,14 @@ impl Staged {
         }
         Ok(stage)
     }
-    fn commit(mut self, warnings: &mut Vec<String>) -> (Vec<PathBuf>, u64) {
+    fn commit(mut self, warnings: &mut Vec<String>) -> (Vec<PathBuf>, u64, Vec<PathBuf>) {
         self.committed = true;
+        // Original paths are already gone even if purging quarantine later fails.
+        let unlinked = self
+            .files
+            .iter()
+            .map(|(original, _, _)| original.clone())
+            .collect();
         let mut deleted = Vec::new();
         let mut bytes = 0u64;
         for (original, staged, size) in &self.files {
@@ -880,6 +974,9 @@ impl Staged {
                 Ok(()) => {
                     deleted.push(original.clone());
                     bytes = bytes.saturating_add(*size);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    deleted.push(original.clone());
                 }
                 Err(e) => warnings.push(format!(
                     "model was unlinked but staged file remains at {}: {e}",
@@ -903,7 +1000,7 @@ impl Staged {
                 ));
             }
         }
-        (deleted, bytes)
+        (deleted, bytes, unlinked)
     }
 }
 impl Drop for Staged {
@@ -1220,7 +1317,290 @@ mod tests {
         let out = f.delete(&id, Some("lm-studio")).unwrap();
         assert_eq!(out["aliasDeleted"], false);
         assert!(!weights.exists());
+        assert!(registry::read(&f.local).unwrap().is_empty());
+        assert_eq!(out["registryCleanupComplete"], true);
+        assert_eq!(out["deletedAliases"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn externally_deleted_gguf_alias_is_removed_without_obsolete_missing_warning() {
+        let f = Fixture::new();
+        let weights = f.file(&f.local, "gone.gguf");
+        for name in ["dead", "unrelated-stale"] {
+            registry::put(
+                &f.local,
+                name,
+                registry::Entry {
+                    path: weights.clone(),
+                    projector: None,
+                },
+            )
+            .unwrap();
+        }
+        fs::remove_file(&weights).unwrap();
+        let before = models::discover(f.options());
+        assert!(
+            before
+                .warnings
+                .iter()
+                .any(|w| w.contains("registered model 'dead:latest' is missing"))
+        );
+        // Discovery is read-only, not a global orphan sweep.
         assert_eq!(registry::read(&f.local).unwrap().len(), 2);
+        let out = f.delete("lma:dead:latest", Some("lma")).unwrap();
+        assert_eq!(out["aliasDeleted"], true);
+        assert_eq!(out["registryCleanupComplete"], true);
+        assert_eq!(out["deletedAliases"].as_array().unwrap().len(), 1);
+        assert!(!out["warnings"].as_array().unwrap().iter().any(|w| {
+            w.as_str()
+                .unwrap()
+                .contains("registered model 'dead:latest'")
+        }));
+        let after = models::discover(f.options());
+        assert!(
+            !after
+                .warnings
+                .iter()
+                .any(|w| w.contains("registered model 'dead:latest'"))
+        );
+        assert!(
+            after
+                .warnings
+                .iter()
+                .any(|w| w.contains("unrelated-stale:latest"))
+        );
+        assert!(
+            registry::read(&f.local)
+                .unwrap()
+                .contains_key("unrelated-stale:latest")
+        );
+        f.delete("lma:unrelated-stale:latest", Some("lma")).unwrap();
+        assert!(models::discover(f.options()).warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_split_deletion_cleans_cross_root_and_symlink_primary_refs_only() {
+        let f = Fixture::new();
+        let first = f.studio.join("choice-00001-of-00002.gguf");
+        let second = f.studio.join("choice-00002-of-00002.gguf");
+        split(&first, 0, 2);
+        split(&second, 1, 2);
+        let other = f.file(&f.local, "other.gguf");
+        let stale = f.file(&f.base, "stale.gguf");
+        let definition = super::super::modelfile::parse("FROM other\nSYSTEM keep me").unwrap();
+        registry::put_definition(
+            &f.local,
+            "unrelated",
+            registry::Entry {
+                path: other.clone(),
+                projector: Some(first.clone()),
+            },
+            definition.clone(),
+        )
+        .unwrap();
+        registry::put(
+            &f.local,
+            "stale",
+            registry::Entry {
+                path: stale.clone(),
+                projector: None,
+            },
+        )
+        .unwrap();
+        fs::remove_file(stale).unwrap();
+        registry::put(
+            &f.studio,
+            "second-shard",
+            registry::Entry {
+                path: second.clone(),
+                projector: None,
+            },
+        )
+        .unwrap();
+        let link = f.base.join("weight-link.gguf");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        // A legacy document can contain symlink paths (put canonicalizes them).
+        let mut entries = registry::read(&f.local).unwrap();
+        entries.insert(
+            "linked:latest".into(),
+            registry::Entry {
+                path: link.clone(),
+                projector: None,
+            },
+        );
+        let mut document: Value =
+            serde_json::from_slice(&fs::read(f.local.join(".registry-v1.json")).unwrap()).unwrap();
+        document["linked:latest"] = serde_json::to_value(&entries["linked:latest"]).unwrap();
+        fs::write(
+            f.local.join(".registry-v1.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let out = f
+            .delete(&format!("lma:{}", first.display()), Some("lm-studio"))
+            .unwrap();
+        assert_eq!(out["aliasDeleted"], false);
+        assert_eq!(out["registryCleanupComplete"], true);
+        assert_eq!(out["deletedAliases"].as_array().unwrap().len(), 2);
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        let remaining = registry::read(&f.local).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains_key("stale:latest"));
+        assert!(remaining.contains_key("unrelated:latest"));
+        assert_eq!(
+            registry::definition(&f.local, "unrelated").unwrap(),
+            Some(definition)
+        );
+        assert!(registry::read(&f.studio).unwrap().is_empty());
+        assert!(other.exists());
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn ollama_cleanup_preserves_shared_blob_and_imported_output_aliases() {
+        let f = Fixture::new();
+        let unique = f.blob(70, b"GGUFunique");
+        let shared = f.blob(71, b"GGUFshared");
+        let source = json!({"schemaVersion":2,"layers":[
+            {"mediaType":"application/vnd.ollama.image.model","digest":unique,"size":10},
+            {"mediaType":"application/vnd.ollama.image.model","digest":shared,"size":10}
+        ]});
+        f.manifest("choice", source.clone());
+        f.model("remaining", &shared);
+        let imported = f.file(&f.local, "imported.gguf");
+        let receipt = f.receipt(&imported, "choice:latest", &source);
+        for (name, path) in [
+            ("unique-a", f.blob_path(&unique)),
+            ("unique-b", f.blob_path(&unique)),
+            ("shared", f.blob_path(&shared)),
+            ("imported", imported.clone()),
+        ] {
+            registry::put(
+                &f.local,
+                name,
+                registry::Entry {
+                    path,
+                    projector: None,
+                },
+            )
+            .unwrap();
+        }
+        let out = f.delete("choice", Some("ollama")).unwrap();
+        assert_eq!(out["registryCleanupComplete"], true);
+        assert_eq!(out["aliasDeleted"], false);
+        assert_eq!(out["deletedAliases"].as_array().unwrap().len(), 2);
+        let remaining = registry::read(&f.local).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains_key("shared:latest"));
+        assert!(remaining.contains_key("imported:latest"));
+        assert!(imported.exists());
+        assert!(receipt.exists());
+        assert!(f.blob_path(&shared).exists());
+        // Alias-only deletion never removes another alias to retained external weights.
+        registry::put(
+            &f.local,
+            "shared-sibling",
+            remaining["shared:latest"].clone(),
+        )
+        .unwrap();
+        let out = f.delete("lma:shared:latest", Some("lma")).unwrap();
+        assert_eq!(out["deletedAliases"].as_array().unwrap().len(), 1);
+        assert!(
+            registry::read(&f.local)
+                .unwrap()
+                .contains_key("shared-sibling:latest")
+        );
+        assert!(f.blob_path(&shared).exists());
+    }
+
+    #[test]
+    fn physical_deletion_reports_registry_lock_failure_after_destruction() {
+        let f = Fixture::new();
+        let weights = f.file(&f.studio, "choice.gguf");
+        registry::put(
+            &f.local,
+            "alias",
+            registry::Entry {
+                path: weights.clone(),
+                projector: None,
+            },
+        )
+        .unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(f.local.join(".registry-v1.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let out = f
+            .delete(&format!("lma:{}", weights.display()), Some("lm-studio"))
+            .unwrap();
+        assert!(!weights.exists());
+        assert_eq!(out["registryCleanupComplete"], false);
+        assert!(out["deletedAliases"].as_array().unwrap().is_empty());
+        assert!(out["warnings"].as_array().unwrap().iter().any(|w| {
+            w.as_str()
+                .unwrap()
+                .contains("registry cleanup is incomplete")
+        }));
+        assert!(
+            registry::read(&f.local)
+                .unwrap()
+                .contains_key("alias:latest")
+        );
+    }
+
+    #[test]
+    fn cleanup_revalidates_retargeted_aliases_and_recreated_assets() {
+        for recreate in [false, true] {
+            let f = Fixture::new();
+            let weights = f.file(&f.studio, "choice.gguf");
+            let other = f.file(&f.base, "other.gguf");
+            registry::put(
+                &f.local,
+                "alias",
+                registry::Entry {
+                    path: weights.clone(),
+                    projector: None,
+                },
+            )
+            .unwrap();
+            let context = Context {
+                roots: vec![f.local.clone()],
+                lm_roots: vec![f.studio.clone()],
+                registry_roots: vec![f.local.clone()],
+                ollama_root: Some(f.store.clone()),
+            };
+            let references = registry_references(&context).unwrap();
+            fs::remove_file(&weights).unwrap();
+            if recreate {
+                fs::write(&weights, b"GGUFrecreated").unwrap();
+            } else {
+                registry::delete(&f.local, "alias").unwrap();
+                registry::put(
+                    &f.local,
+                    "alias",
+                    registry::Entry {
+                        path: other,
+                        projector: None,
+                    },
+                )
+                .unwrap();
+            }
+            let mut warnings = Vec::new();
+            let cleanup =
+                cleanup_registry(&references, &[weights.clone()], &[weights], &mut warnings);
+            assert!(cleanup.complete);
+            assert!(cleanup.deleted.is_empty());
+            assert!(warnings.is_empty());
+            assert!(
+                registry::read(&f.local)
+                    .unwrap()
+                    .contains_key("alias:latest")
+            );
+        }
     }
 
     #[test]
@@ -1320,6 +1700,38 @@ mod tests {
         assert!(external_manifest.exists());
         assert!(fs::symlink_metadata(&selected).is_ok());
         assert!(f.blob_path(&d).exists());
+    }
+    #[test]
+    fn failed_quarantine_purge_still_cleans_aliases_to_unlinked_primary_weights() {
+        let f = Fixture::new();
+        let model = f.file(&f.studio, "choice.gguf");
+        let entry = registry::Entry {
+            path: model.clone(),
+            projector: None,
+        };
+        registry::put(&f.local, "choice", entry.clone()).unwrap();
+        let references = BTreeMap::from([(
+            f.local.clone(),
+            BTreeMap::from([("choice:latest".into(), (entry, model.clone()))]),
+        )]);
+        let staged = Staged::new(vec![model.clone()]).unwrap();
+        // Simulate an unpurgeable quarantine entry, without touching real stores.
+        fs::remove_file(&staged.files[0].1).unwrap();
+        fs::create_dir(&staged.files[0].1).unwrap();
+        let mut warnings = Vec::new();
+        let (deleted, bytes, unlinked) = staged.commit(&mut warnings);
+        assert!(deleted.is_empty());
+        assert_eq!(bytes, 0);
+        assert!(!model.exists());
+        let cleanup = cleanup_registry(&references, &[model], &unlinked, &mut warnings);
+        assert!(cleanup.complete);
+        assert_eq!(cleanup.deleted.len(), 1);
+        assert!(registry::read(&f.local).unwrap().is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("staged file remains"))
+        );
     }
     #[test]
     fn registry_publication_failure_rolls_staged_weights_back() {

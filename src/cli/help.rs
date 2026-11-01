@@ -89,7 +89,7 @@ COMMANDS
 ├─ lh [NAME]             Pick model + target  / nss launch [NAME]
 ├─ c [NAME]              Terminal chat        / nss chat [NAME]
 ├─ t [OPTIONS] WAV       Whisper transcription / nss transcribe
-├─ s NAME                Serve browser chat and HTTP APIs / nss serve NAME
+├─ s [NAME]              Serve browser chat and HTTP APIs / nss serve [NAME]
 ├─ sp [-m NAME]          Stop/unload a model  / nss stop
 │  ├─ s -p FILE          Select an explicit local GGUF
 │  └─ s -ct PRESET       Print connection settings; -a selects API routes
@@ -108,6 +108,7 @@ EXAMPLES
   lma c llama3.2              / lma nss chat llama3.2
   lma c llama3.2 -ts off -c 8k # No reply cap; context remains bounded
   lma t -m whisper audio.wav  / lma nss transcribe -m whisper audio.wav
+  lma s                       / lma nss serve (idle; models chosen by requests)
   lma s llama3.2              / lma nss serve llama3.2
   lma sp                     / lma nss stop
   lma s -p model.gguf -ct claude-code
@@ -202,17 +203,26 @@ start a server. Use `lma s NAME` or `lma s -p FILE` for hosting.
 ";
 
 pub(super) const SERVE: &str = "\
-lma s — one local model, browser chat, and an HTTP API.
+lma s — local model server, browser chat, and HTTP APIs.
 
 With -a all/openai, open http://127.0.0.1:8080/ (or your configured port).
 Browser chat: Ctrl/Cmd+Enter sends; keys stay in memory, not browser storage.
-Ollama/Anthropic-only profiles show API info at / instead of browser chat.
+Ollama/llama/lma/Anthropic-only profiles show API info JSON at /, not browser chat.
 
 USAGE
-  lma s NAME [OPTIONS]
+  lma s [NAME] [OPTIONS]
   lma s -m NAME [OPTIONS]
   lma s -p FILE [OPTIONS]
-  lma nss serve --model NAME [OPTIONS]
+  lma nss serve [NAME] [OPTIONS]
+
+IDLE STARTUP AND DISCOVERY
+  No model is required: `lma s` starts without loading weights or opening setup.
+  GET /api/tags lists installed models with all/ollama (default: all).
+  GET /v1/models lists installed models for every profile; /api/ps is initially empty.
+  The first generation/load request must name an installed model. Later requests
+  may omit model while one is resident. An explicit startup NAME/-m/-p still
+  preloads that model. No discovery request loads or downloads weights.
+  Example: lma s -a ollama -pt 11434 (requires that port to be available).
 
 MODEL & SPEED
   -m NAME       Installed model name (or positional NAME)
@@ -303,7 +313,7 @@ CACHE & MEMORY
   This is GGUF/llama.cpp, not FreeToken's FTW/MoE runtime or a performance promise.
 
 HTTP & CONNECTION PRESETS
-      -a PROFILE     all|openai|ollama|anthropic (default: all)
+      -a PROFILE     all|openai|ollama|llama|lma|anthropic (default: all)
       -ct PRESET   default|claude-code|codex|zed|vscode|opencode|custom
                         Default: default. vscode means the Continue extension.
                         Without -a: claude-code -> anthropic;
@@ -332,8 +342,10 @@ NSS-ONLY LONG-FORM OPTIONS
   NSS -- supports only documented options, never upstream passthrough.
 
 SUPPORTED FEATURES & LIMITS
-  OpenAI, Ollama, and Anthropic adapters expose supported request subsets,
-  not full API or agent compatibility. Client presets print connection setup;
+  OpenAI, Ollama, llama, native lma, and Anthropic expose request subsets,
+  not full llama-server, cloud API, or agent parity. All profiles use the
+  same in-process engine; no performance claim. See docs/endpoints.md.
+  Client presets print connection setup;
   they never spawn Claude Code, Codex, or other external agent processes.
   Function tools are client-executed; lma never runs commands or hosted tools.
   Native text streaming is supported; tool arguments are constrained/buffered,
@@ -484,7 +496,7 @@ MODEL & SPEED (same flags and validation as serve; model is optional here)
                          Full model/cache/backend limits: `lma h s`
 
 CONNECTION SETTINGS (retained for shared config; use serve for HTTP hosting)
-      -a PROFILE      all|openai|ollama|anthropic (default: all)
+      -a PROFILE      all|openai|ollama|llama|lma|anthropic (default: all)
       -ct PRESET    default|claude-code|codex|zed|vscode|opencode|custom
                          vscode selects Continue, not a universal VS Code API.
                          Omitted -a: claude-code -> anthropic;
@@ -611,7 +623,7 @@ SHARED FLAGS
                          Graph metadata/workspaces can grow outside the slot budget
                          CPU routing prep/uploads stay synchronous; no speed guarantee
                          Unsupported architectures error; host-only, not Modelfile
-      -a all|openai|ollama|anthropic
+      -a all|openai|ollama|llama|lma|anthropic
       -ct default|claude-code|codex|zed|vscode|opencode|custom
       -ht HOST, -pt PORT, -ay KEY
                          Hosting flags are retained in config, not a promise
@@ -722,22 +734,61 @@ ENDPOINTS
   POST /v1/messages/count_tokens
                               HTTP 200: {\"input_tokens\":N} (served GGUF tokens)
   POST /v1/responses          Stateless Responses + function tools
+  GET  /props                llama model/context properties
+  POST /completion           llama raw text completion, optional SSE
+  POST /tokenize             Actual model token IDs from content
+  POST /detokenize           Text from actual model vocabulary token IDs
+  GET  /lma/v1/status        Native lma status (api_version:1)
+  POST /lma/v1/generate      Native raw text generation, optional NDJSON
+  POST /lma/v1/chat          Native text/image chat, optional NDJSON; no tools
 
 API PROFILES
-  --api all enables all families (default); openai enables completions/chat/
-  responses; ollama enables the /api routes above; anthropic enables /v1/messages and
-  /v1/messages/count_tokens. /health and /v1/models remain shared.
-  Browser chat is available with all/openai; other profiles show API info at /.
+  Root: lma s MODEL -a PROFILE. NSS: lma nss serve MODEL --api PROFILE.
+  all|openai|ollama|llama|lma|anthropic; all enables every family (default).
+  openai enables completions/chat/responses/embeddings; ollama enables /api
+  routes; anthropic preserves /v1/messages and /v1/messages/count_tokens.
+  llama enables /props, /completion, /tokenize, /detokenize only.
+  lma enables /lma/v1/status, /lma/v1/generate, /lma/v1/chat only.
+  /health and /v1/models remain shared; /api/stop is shared host control.
+  Browser chat is available with all/openai; others show API info JSON at /.
+  These are subsets, not full llama-server or cloud parity. All profiles use
+  the same in-process engine; no performance claim. See docs/endpoints.md.
   --client default|claude-code|codex|zed|vscode|opencode|custom prints presets.
   Without --api: claude-code selects anthropic; codex/zed/vscode/opencode select
   openai; default/custom select all. Explicit --api wins in either order,
-  even if it disables a preset's API. No environment mutation, config-file
-  writes, external agent spawning, or secrets in printed connection settings.
+  even if it disables a preset's API; no usable preset is printed in that case.
+  No environment mutation, config-file writes, external agent spawning,
+  or secrets in printed connection settings.
   zed configures the OpenAI-compatible model provider, NOT ACP/external agents.
   vscode configures the Continue extension, not a universal VS Code API.
   opencode selects @ai-sdk/openai-compatible for Chat Completions; codex uses
   a user-level Responses provider with WebSockets and compression disabled.
   No installed-client end-to-end compatibility is claimed; see docs/clients.md.
+
+LLAMA SUBSET
+  Base URL: http://127.0.0.1:8080 (NOT /v1).
+  POST /completion: prompt:string, n_predict:positive|-1, temperature (alias
+  temp), top_p, seed, stream (default false; true enables SSE).
+  Omitted n_predict inherits stored num_predict, otherwise 256; -1 means
+  remaining context. Slots, FIM, cache_prompt, and stop controls are rejected.
+  POST /tokenize: content:string, add_special/parse_special booleans (default false).
+  POST /detokenize: tokens:[i32]. Uses actual token IDs/model vocabulary,
+  not character/byte stand-ins. Unsupported fields are rejected.
+
+NATIVE LMA V1
+  Base URL: http://127.0.0.1:8080/lma/v1.
+  /generate takes prompt:string; /chat takes messages using the existing
+  OpenAI role/content/images schema, but no tools or remote image fetching.
+  Both accept model?:string, max_tokens?:positive|null, temperature, top_p,
+  seed, stream (default false). Omitted max_tokens inherits stored num_predict
+  or defaults to 256; explicit null means remaining context/no reply cap.
+  Zero/negative max_tokens are rejected. Nonstream JSON: api_version:1, id,
+  model, text, usage:{input_tokens,output_tokens}, finish_reason:
+  eos|token_limit|context_limit. stream:true emits NDJSON start/delta/done/error
+  records; delta carries text, done carries usage/finish without aggregate text.
+  New routes have 1 MiB bodies except native /lma/v1/chat (24 MiB).
+  HTTP model selection accepts installed models only; unknown names/filepaths
+  never trigger implicit downloads. Streaming host leases last until body done.
 
 TEXT REQUEST
   {\"prompt\":\"Once upon a time\",\"max_tokens\":64}
@@ -840,7 +891,8 @@ Only one generation runs at once; busy requests receive HTTP 429.
 Context persists; default prompt caching only reuses safe exact prefixes of
 identical/extended text prompts, not edits, semantic anchors, or recurrent/
 hybrid state. Send desired chat history each time; no server-managed history.
-With --api-key, send `Authorization: Bearer KEY` on enabled /v1/* and /api/chat.
+With --api-key, send `Authorization: Bearer KEY` on every protected API route,
+including llama/native lma, discovery, and shared /api/stop control.
 Only /v1/messages and /v1/messages/count_tokens also accept `x-api-key: KEY`.
 /health stays public; non-loopback use needs external TLS/firewall protection.
 ";

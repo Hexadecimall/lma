@@ -1,6 +1,6 @@
 //! A single-resident-model host. API model selection never shells out or accepts
 //! arbitrary remote filesystem paths. Read leases keep streaming workers alive.
-use super::server::{ApiError, IMAGE_BODY_LIMIT};
+use super::server::{ApiError, BODY_LIMIT, IMAGE_BODY_LIMIT};
 use crate::{
     config::ServeConfig,
     models::{
@@ -170,17 +170,24 @@ fn selection_base(base: &ServeConfig) -> ServeConfig {
 
 impl Host {
     pub async fn new(config: ServeConfig) -> Result<(Router, Self), String> {
-        let config = tokio::task::spawn_blocking(move || resident_config(config))
-            .await
-            .map_err(|error| error.to_string())??;
-        let (app, worker) = super::server::build(config.clone()).await?;
-        let host = Self {
-            base: config.clone(),
-            loaded: Arc::new(RwLock::new(Some(Loaded {
+        super::server::validate_hosting(&config)?;
+        let (config, loaded) = if config.model.as_os_str().is_empty() {
+            (config, None)
+        } else {
+            let config = tokio::task::spawn_blocking(move || resident_config(config))
+                .await
+                .map_err(|error| error.to_string())??;
+            let (app, worker) = super::server::build(config.clone()).await?;
+            let loaded = Loaded {
                 app,
                 worker,
-                config,
-            }))),
+                config: config.clone(),
+            };
+            (config, Some(loaded))
+        };
+        let host = Self {
+            base: config,
+            loaded: Arc::new(RwLock::new(loaded)),
             operations: Arc::new(Mutex::new(())),
             epoch: Arc::new(AtomicU64::new(0)),
         };
@@ -302,14 +309,9 @@ impl Host {
                 .map_err(|_| busy())?;
             let model = model
                 .or_else(|| host.base.model_id.clone())
-                .unwrap_or_else(|| {
-                    host.base
-                        .model
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                });
+                .or_else(|| host.base.model.file_name().map(|name| name.to_string_lossy().into_owned()))
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| invalid("model is required while no model is loaded; choose an installed name from /api/tags or /v1/models"))?;
             let resolver = host.clone();
             let config =
                 tokio::task::spawn_blocking(move || resident_config(resolve(resolver, model)?))
@@ -341,26 +343,34 @@ impl Host {
         .map_err(|e| invalid(e.to_string()))?
     }
     async fn stop(&self, model: Option<&str>) -> Result<Value, ApiError> {
-        let _operation = self
-            .operations
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| busy())?;
-        let mut guard = self.loaded.clone().try_write_owned().map_err(|_| busy())?;
-        if let Some(current) = guard.as_ref()
-            && model.is_some_and(|name| {
-                current.config.model_id.as_deref() != Some(name)
-                    && current.config.model.file_name().is_none_or(|n| n != name)
-            })
-        {
-            return Err(invalid("requested model is not currently loaded"));
-        }
-        self.epoch.fetch_add(1, Ordering::SeqCst);
-        if let Some(previous) = guard.take() {
-            drop(previous.app);
-            previous.worker.await.map_err(|e| invalid(e.to_string()))?;
-        }
-        Ok(json!({"status":"success", "loaded":false}))
+        let host = self.clone();
+        let model = model.map(str::to_owned);
+        // A disconnected stop caller must not abandon native teardown and let
+        // a new load start while the old worker still owns its engine.
+        tokio::spawn(async move {
+            let _operation = host
+                .operations
+                .clone()
+                .try_lock_owned()
+                .map_err(|_| busy())?;
+            let mut guard = host.loaded.clone().try_write_owned().map_err(|_| busy())?;
+            if let Some(current) = guard.as_ref()
+                && model.as_deref().is_some_and(|name| {
+                    current.config.model_id.as_deref() != Some(name)
+                        && current.config.model.file_name().is_none_or(|n| n != name)
+                })
+            {
+                return Err(invalid("requested model is not currently loaded"));
+            }
+            host.epoch.fetch_add(1, Ordering::SeqCst);
+            if let Some(previous) = guard.take() {
+                drop(previous.app);
+                previous.worker.await.map_err(|e| invalid(e.to_string()))?;
+            }
+            Ok(json!({"status":"success", "loaded":false}))
+        })
+        .await
+        .map_err(|e| invalid(e.to_string()))?
     }
     fn expire(&self, epoch: u64, keep: Option<Duration>) {
         let Some(keep) = keep else {
@@ -470,6 +480,25 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
                 .into_response(),
         );
     }
+    if path == "/" && !matches!(host.base.api.as_str(), "all" | "openai") {
+        if !matches!(
+            *request.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ) {
+            return Err(ApiError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "method not allowed",
+            ));
+        }
+        let response = Json(super::server::api_info(&host.base.api)).into_response();
+        return Ok(if request.method() == axum::http::Method::HEAD {
+            let (parts, _) = response.into_parts();
+            Response::from_parts(parts, Body::empty())
+        } else {
+            response
+        });
+    }
     if !allowed(&host, &request) {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -477,21 +506,52 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
             "a valid API key is required",
         ));
     }
-    let family = if path.starts_with("/api/") {
-        "ollama"
-    } else if matches!(path.as_str(), "/v1/messages" | "/v1/messages/count_tokens") {
-        "anthropic"
-    } else {
-        "openai"
-    };
-    if host.base.api != "all"
-        && host.base.api != family
-        && !matches!(path.as_str(), "/api/stop" | "/v1/models")
+    let family = super::server::api_family(&path);
+    if !matches!(path.as_str(), "/api/stop" | "/v1/models")
+        && (family.is_none() || (host.base.api != "all" && family != Some(host.base.api.as_str())))
     {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "not_found",
             "API family is disabled",
+        ));
+    }
+    if matches!(path.as_str(), "/props" | "/lma/v1/status") {
+        if !matches!(
+            *request.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ) {
+            return Err(ApiError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "method not allowed",
+            ));
+        }
+        // Read-only metadata must not reload an unloaded model or cancel its expiry.
+        let lease = host.loaded.clone().read_owned().await;
+        let loaded = lease.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_not_loaded",
+                "no model loaded",
+            )
+        })?;
+        return loaded
+            .app
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|_| invalid("resident router failed"));
+    }
+    if matches!(
+        path.as_str(),
+        "/completion" | "/tokenize" | "/detokenize" | "/lma/v1/generate" | "/lma/v1/chat"
+    ) && request.method() != axum::http::Method::POST
+    {
+        return Err(ApiError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "method not allowed",
         ));
     }
     if request.method() == axum::http::Method::GET {
@@ -556,20 +616,37 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
     let (mut parts, body) = request.into_parts();
     let limit = if path == "/api/create" {
         modelfile::MAX_BYTES
+    } else if matches!(
+        path.as_str(),
+        "/completion" | "/tokenize" | "/detokenize" | "/lma/v1/generate"
+    ) {
+        BODY_LIMIT
     } else {
         IMAGE_BODY_LIMIT
     };
-    let bytes = axum::body::to_bytes(body, limit)
-        .await
-        .map_err(|_| invalid("request exceeds body limit"))?;
+    let bytes = axum::body::to_bytes(body, limit).await.map_err(|_| {
+        ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "request exceeds body limit",
+        )
+    })?;
     let mut body: Value =
         serde_json::from_slice(&bytes).map_err(|_| invalid("expected a JSON object"))?;
     if !body.is_object() {
         return Err(invalid("expected a JSON object"));
     }
-    let model = body
-        .get("model")
-        .or_else(|| body.get("name"))
+    match family {
+        Some("llama") => super::llama_api::validate_body(&path, &body)?,
+        Some("lma") => super::native_api::validate_body(&body, path == "/lma/v1/chat")?,
+        _ => {}
+    }
+    let selector = if matches!(family, Some("llama" | "lma")) {
+        body.get("model")
+    } else {
+        body.get("model").or_else(|| body.get("name"))
+    };
+    let model = selector
         .filter(|value| !value.is_null())
         .map(|v| {
             v.as_str()
@@ -611,6 +688,11 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
             | "/v1/messages"
             | "/v1/messages/count_tokens"
             | "/v1/embeddings"
+            | "/completion"
+            | "/tokenize"
+            | "/detokenize"
+            | "/lma/v1/generate"
+            | "/lma/v1/chat"
     );
     if !generation {
         return Err(ApiError::new(
@@ -619,12 +701,12 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
             "route not found",
         ));
     }
-    let keep = if family == "ollama" {
+    let keep = if family == Some("ollama") {
         keep_alive(body.get("keep_alive"))?
     } else {
         None
     };
-    if family == "ollama" {
+    if family == Some("ollama") {
         body.as_object_mut().unwrap().remove("keep_alive");
     }
     // Ollama's empty generate request explicitly loads or unloads the chosen model.
@@ -642,6 +724,12 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
         }
         return Ok(Json(json!({"model":model,"response":"","done":true,"done_reason":if keep == Some(Duration::ZERO) { "unload" } else { "load" }})).into_response());
     }
+    let tokenizer = matches!(path.as_str(), "/tokenize" | "/detokenize");
+    if tokenizer && body.get("model").is_some() {
+        return Err(invalid(
+            "tokenizer utilities use the current model; model selection is not supported in their request bodies",
+        ));
+    }
     let lease = host.lease(model).await?;
     let loaded = lease.as_ref().ok_or_else(|| invalid("no model loaded"))?;
     let id = loaded.config.model_id.clone().unwrap_or_else(|| {
@@ -653,7 +741,9 @@ async fn handle(host: Host, request: Request) -> Result<Response, ApiError> {
             .to_string_lossy()
             .into_owned()
     });
-    body["model"] = json!(id);
+    if !tokenizer {
+        body["model"] = json!(id);
+    }
     let app = loaded.app.clone();
     let epoch = host.epoch.fetch_add(1, Ordering::SeqCst) + 1;
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -1022,6 +1112,20 @@ mod tests {
         cached: bool,
     }
     impl super::super::inference::Engine for Fake {
+        fn tokenize(
+            &self,
+            _: super::super::inference::TokenizeRequest,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Vec<i32>, super::super::inference::InferenceError> {
+            Ok(vec![42])
+        }
+        fn detokenize(
+            &self,
+            _: Vec<i32>,
+            _: &dyn Fn() -> bool,
+        ) -> Result<String, super::super::inference::InferenceError> {
+            Ok("fixture".into())
+        }
         fn generate(
             &mut self,
             _: super::super::inference::GenerationRequest,
@@ -1083,6 +1187,98 @@ mod tests {
             .unwrap()
     }
     #[tokio::test]
+    async fn idle_server_has_health_and_ps_without_initializing_a_model() {
+        let (app, host) = Host::new(ServeConfig::default()).await.unwrap();
+        assert!(host.loaded.read().await.is_none());
+        for (path, expected) in [
+            ("/health", json!({"status":"ok","loaded":false})),
+            ("/api/ps", json!({"models":[]})),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+        }
+        let response = dispatch(
+            State(host.clone()),
+            request("/api/generate", json!({"prompt":"hi","stream":false})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("model is required")
+        );
+        assert!(host.loaded.read().await.is_none());
+        drop(app);
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn idle_server_preserves_auth_and_api_profile_gates() {
+        let (app, host) = Host::new(ServeConfig {
+            api: "openai".into(),
+            api_key: Some("secret".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let req = Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let req = Request::builder()
+            .uri("/api/tags")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(host.loaded.read().await.is_none());
+        drop(app);
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn idle_first_model_selection_remains_lazy_and_retains_a_reusable_snapshot() {
+        let (_directory, config) = tokio::task::spawn_blocking(resident_fixture).await.unwrap();
+        let (app, host) = Host::new(ServeConfig::default()).await.unwrap();
+        let builds = Arc::new(AtomicU64::new(0));
+        assert!(host.loaded.read().await.is_none());
+        let lease = fixture_lease(&host, "fixture:latest", config, builds.clone())
+            .await
+            .unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture_generation(&lease).await["choices"][0]["text"],
+            "hello"
+        );
+        drop(lease);
+        let lease = host.lease(None).await.unwrap();
+        assert_eq!(
+            fixture_generation(&lease).await["choices"][0]["text"],
+            "cached"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        drop(lease);
+        drop(app);
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
     async fn response_lease_prevents_unload_until_client_finishes() {
         let host = fake_host().await;
         let response = handle(
@@ -1127,6 +1323,368 @@ mod tests {
         assert_eq!(stopped.status(), StatusCode::OK);
         assert!(host.loaded.read().await.is_none());
     }
+    #[tokio::test]
+    async fn new_families_are_forwarded_and_stream_bodies_hold_the_host_lease() {
+        for api in ["all", "llama", "lma"] {
+            let host = fake_host_with_config(ServeConfig {
+                model: "fixture.gguf".into(),
+                model_id: Some("fixture:latest".into()),
+                api: api.into(),
+                ..Default::default()
+            })
+            .await;
+            for (family, path, body) in [
+                (
+                    "llama",
+                    "/completion",
+                    json!({"prompt":"hello","stream":true}),
+                ),
+                (
+                    "lma",
+                    "/lma/v1/generate",
+                    json!({"prompt":"hello","stream":true,"max_tokens":null}),
+                ),
+                (
+                    "lma",
+                    "/lma/v1/chat",
+                    json!({"messages":[{"role":"user","content":"hi"}],"stream":true}),
+                ),
+            ] {
+                let response = dispatch(State(host.clone()), request(path, body)).await;
+                if api != "all" && api != family {
+                    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                    continue;
+                }
+                assert_eq!(response.status(), StatusCode::OK, "{api} {path}");
+                assert_eq!(
+                    host.stop(None).await.unwrap_err().into_response().status(),
+                    StatusCode::CONFLICT
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                let wire = std::str::from_utf8(&bytes).unwrap();
+                assert!(wire.contains("hello") || wire.contains("cached"));
+                assert!(wire.contains(if family == "llama" {
+                    "\"stop\":true"
+                } else {
+                    "\"type\":\"done\""
+                }));
+            }
+            if matches!(api, "all" | "llama") {
+                for (path, body) in [
+                    ("/tokenize", json!({"content":"hello"})),
+                    ("/detokenize", json!({"tokens":[42]})),
+                ] {
+                    let response = dispatch(State(host.clone()), request(path, body)).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        value,
+                        if path == "/tokenize" {
+                            json!({"tokens":[42]})
+                        } else {
+                            json!({"content":"fixture"})
+                        }
+                    );
+                }
+            }
+            assert!(host.loaded.read().await.is_some());
+            host.shutdown().await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn new_metadata_is_authenticated_read_only_and_does_not_reload() {
+        for (api, path) in [("llama", "/props"), ("lma", "/lma/v1/status")] {
+            let host = fake_host_with_config(ServeConfig {
+                model: "fixture.gguf".into(),
+                model_id: Some("fixture:latest".into()),
+                api: api.into(),
+                api_key: Some("secret".into()),
+                ..Default::default()
+            })
+            .await;
+            let get = |path: &str, auth: bool| {
+                let mut req = Request::builder().method("GET").uri(path);
+                if auth {
+                    req = req.header(header::AUTHORIZATION, "Bearer secret");
+                }
+                req.body(Body::empty()).unwrap()
+            };
+            let response = dispatch(State(host.clone()), get("/", false)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                dispatch(State(host.clone()), get(path, false))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let epoch = host.epoch.load(Ordering::SeqCst);
+            assert_eq!(
+                dispatch(State(host.clone()), get(path, true))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                host.epoch.load(Ordering::SeqCst),
+                epoch,
+                "metadata polling must not change idle expiry"
+            );
+            assert_eq!(host.stop(None).await.unwrap()["status"], "success");
+            assert_eq!(
+                dispatch(State(host.clone()), get(path, true))
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(host.loaded.read().await.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn new_host_routes_enforce_methods_body_limits_and_disable_other_families() {
+        let host = fake_host_with_config(ServeConfig {
+            model: "fixture.gguf".into(),
+            model_id: Some("fixture:latest".into()),
+            api: "llama".into(),
+            ..Default::default()
+        })
+        .await;
+        for path in ["/completion", "/tokenize", "/detokenize"] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            assert_eq!(
+                dispatch(State(host.clone()), req).await.status(),
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(" ".repeat(BODY_LIMIT + 1)))
+                .unwrap();
+            assert_eq!(
+                dispatch(State(host.clone()), req).await.status(),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+        let response = dispatch(
+            State(host.clone()),
+            request("/tokenize", json!({"content":"hi","model":"missing"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(host.loaded.read().await.is_some());
+        assert_eq!(
+            dispatch(
+                State(host.clone()),
+                request("/lma/v1/generate", json!({"prompt":"hi"}))
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_stop_retains_lifecycle_gates_until_worker_teardown() {
+        let (finish, wait) = tokio::sync::oneshot::channel::<()>();
+        let config = ServeConfig {
+            model: "fixture.gguf".into(),
+            ..Default::default()
+        };
+        let host = Host {
+            base: config.clone(),
+            loaded: Arc::new(RwLock::new(Some(Loaded {
+                app: Router::new(),
+                worker: tokio::spawn(async move {
+                    let _ = wait.await;
+                }),
+                config,
+            }))),
+            operations: Arc::new(Mutex::new(())),
+            epoch: Arc::new(AtomicU64::new(0)),
+        };
+        let stopping = host.clone();
+        let caller = tokio::spawn(async move { stopping.stop(None).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while host.operations.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        assert!(host.operations.try_lock().is_err());
+        assert!(host.loaded.try_write().is_err());
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(_operation) = host.operations.try_lock() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(host.loaded.read().await.is_none());
+    }
+    #[tokio::test]
+    async fn new_host_preflight_rejects_invalid_controls_before_resident_selection() {
+        for (api, path, invalids) in [
+            (
+                "llama",
+                "/completion",
+                vec![
+                    json!({"prompt":"x","model":null}),
+                    json!({"prompt":"x","n_predict":0}),
+                    json!({"prompt":"x","name":"other"}),
+                ],
+            ),
+            (
+                "lma",
+                "/lma/v1/generate",
+                vec![
+                    json!({"prompt":"x","model":null}),
+                    json!({"prompt":"x","max_tokens":0}),
+                    json!({"prompt":"x","temperature":null}),
+                    json!({"prompt":"x","name":"other"}),
+                ],
+            ),
+            (
+                "llama",
+                "/tokenize",
+                vec![
+                    json!({"content":"x","name":"other"}),
+                    json!({"content":"x","model":"other"}),
+                    json!({"content":"x","parse_special":null}),
+                ],
+            ),
+        ] {
+            let host = fake_host_with_config(ServeConfig {
+                model: "fixture.gguf".into(),
+                model_id: Some("fixture:latest".into()),
+                api: api.into(),
+                ..Default::default()
+            })
+            .await;
+            let epoch = host.epoch.load(Ordering::SeqCst);
+            for body in invalids {
+                assert_eq!(
+                    dispatch(State(host.clone()), request(path, body))
+                        .await
+                        .status(),
+                    StatusCode::BAD_REQUEST
+                );
+                assert_eq!(
+                    host.epoch.load(Ordering::SeqCst),
+                    epoch,
+                    "preflight failure must not acquire a new resident lease"
+                );
+                assert_eq!(
+                    host.loaded
+                        .read()
+                        .await
+                        .as_ref()
+                        .unwrap()
+                        .config
+                        .model_id
+                        .as_deref(),
+                    Some("fixture:latest")
+                );
+            }
+            host.shutdown().await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn chat_preflight_keeps_resident_and_epoch_for_invalid_content_with_other_model() {
+        let host = fake_host_with_config(ServeConfig {
+            model: "fixture.gguf".into(),
+            model_id: Some("fixture:latest".into()),
+            api: "lma".into(),
+            ..Default::default()
+        })
+        .await;
+        let epoch = host.epoch.load(Ordering::SeqCst);
+        let worker = host.loaded.read().await.as_ref().unwrap().worker.id();
+        for (message, expected) in [
+            (
+                json!({"role":"user","content":""}),
+                "message content must be nonempty",
+            ),
+            (
+                json!({"role":"user","content":[]}),
+                "message content must be nonempty",
+            ),
+            (
+                json!({"role":"tool","content":"result"}),
+                "message role must be",
+            ),
+            (
+                json!({"role":"user","content":"bad\0text"}),
+                "must not contain NUL",
+            ),
+            (
+                json!({"role":"system","content":"x","images":["not-base64"]}),
+                "only user messages",
+            ),
+            (
+                json!({"role":"assistant","content":[{"type":"image_url","image_url":{"url":"invalid"}}]}),
+                "only user messages",
+            ),
+            (
+                json!({"role":"user","content":[{"type":"text","text":"x"},{"type":"image_url","image_url":{"url":"invalid"}}]}),
+                "image parts must precede",
+            ),
+            (
+                json!({"role":"user","content":[{"type":"text","text":"<__"},{"type":"text","text":"media__>"}]}),
+                "reserved image markers",
+            ),
+            (
+                json!({"role":"user","content":[{"type":"text","text":"<__lma_"},{"type":"text","text":"image_0>"}]}),
+                "reserved image markers",
+            ),
+            (
+                json!({"role":"user","content":[{"type":"text","text":"<__"},{"type":"text","text":"image__>"}]}),
+                "reserved image markers",
+            ),
+        ] {
+            let response = dispatch(
+                State(host.clone()),
+                request(
+                    "/lma/v1/chat",
+                    json!({
+                        "model":"other",
+                        "messages":[message],
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{error}"
+            );
+            assert_eq!(host.epoch.load(Ordering::SeqCst), epoch);
+            let resident = host.loaded.read().await;
+            let resident = resident.as_ref().unwrap();
+            assert_eq!(resident.worker.id(), worker);
+            assert_eq!(resident.config.model_id.as_deref(), Some("fixture:latest"));
+        }
+        host.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn metadata_and_stop_routes_require_authentication() {
         let mut host = fake_host().await;

@@ -10,6 +10,8 @@ mod imagegen;
 mod inference;
 pub(crate) mod launch;
 mod list;
+mod llama_api;
+mod native_api;
 mod ollama;
 pub mod quantize;
 pub mod server;
@@ -33,7 +35,9 @@ pub fn run(mut plan: Plan) -> Result<(), String> {
             .model
             .to_str()
             .is_some_and(|model| model.starts_with("lma:"));
-        if !plan.dry_run || explicit_ollama || explicit_profile {
+        if !config.model.as_os_str().is_empty()
+            && (!plan.dry_run || explicit_ollama || explicit_profile)
+        {
             resolve_model(config)?;
         }
     }

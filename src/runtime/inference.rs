@@ -11,6 +11,7 @@ use llama_cpp_2::{
     model::{LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
     token::LlamaToken,
+    vocab::BoundedVocabError,
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
@@ -190,6 +191,88 @@ pub(super) fn normalize_embedding(vector: &mut [f32]) -> Result<(), InferenceErr
     Ok(())
 }
 
+/// Raw vocabulary operations never format a prompt or allocate an inference context.
+#[derive(Debug)]
+pub(super) struct TokenizeRequest {
+    pub content: String,
+    pub add_special: bool,
+    pub parse_special: bool,
+}
+
+pub(super) const TOKENIZER_MAX_BYTES: usize = 1024 * 1024;
+pub(super) const TOKENIZER_MAX_TOKENS: usize = 128 * 1024;
+
+impl TokenizeRequest {
+    pub fn validate(&self) -> Result<(), InferenceError> {
+        if self.content.len() > TOKENIZER_MAX_BYTES {
+            return Err(InferenceError::Invalid(
+                "tokenizer content exceeds the 1 MiB byte limit".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn tokenizer_native_error(error: BoundedVocabError, limit: &str) -> InferenceError {
+    match error {
+        BoundedVocabError::OutputTooLarge => InferenceError::Invalid(limit.into()),
+        BoundedVocabError::InvalidToken | BoundedVocabError::InputTooLarge => {
+            InferenceError::Invalid(error.to_string())
+        }
+        BoundedVocabError::AllocationFailed | BoundedVocabError::InvalidNativeResult => {
+            InferenceError::Internal(error.to_string())
+        }
+    }
+}
+
+fn tokenizer_utf8(
+    bytes: &[u8],
+    limit: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String, InferenceError> {
+    let mut length = 0_usize;
+    // Count replacement-expanded UTF-8 before allocating, then reserve exactly
+    // that much. Decoding individual token pieces would corrupt split scalars.
+    for chunk in bytes.utf8_chunks() {
+        ensure_active(cancelled)?;
+        length = length
+            .checked_add(chunk.valid().len())
+            .and_then(|n| n.checked_add(if chunk.invalid().is_empty() { 0 } else { 3 }))
+            .filter(|&n| n <= limit)
+            .ok_or_else(|| {
+                InferenceError::Invalid("UTF-8 detokenized content exceeds the byte limit".into())
+            })?;
+    }
+    ensure_active(cancelled)?;
+    let mut content = String::new();
+    content.try_reserve_exact(length).map_err(|error| {
+        InferenceError::Internal(format!("cannot allocate bounded UTF-8 content: {error}"))
+    })?;
+    for chunk in bytes.utf8_chunks() {
+        ensure_active(cancelled)?;
+        content.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            content.push('\u{fffd}');
+        }
+    }
+    ensure_active(cancelled)?;
+    Ok(content)
+}
+
+fn validate_detokenize(tokens: &[i32]) -> Result<(), InferenceError> {
+    if tokens.len() > TOKENIZER_MAX_TOKENS {
+        return Err(InferenceError::Invalid(
+            "tokenizer input exceeds the 128k token limit".into(),
+        ));
+    }
+    if tokens.iter().any(|&id| id < 0) {
+        return Err(InferenceError::Invalid(
+            "token IDs must be nonnegative native vocabulary IDs".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) enum GenerationEvent {
     Delta(String),
@@ -244,6 +327,26 @@ pub(super) trait Engine: Send + 'static {
         ))
     }
 
+    fn tokenize(
+        &self,
+        _request: TokenizeRequest,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<i32>, InferenceError> {
+        Err(InferenceError::Invalid(
+            "this engine does not support native tokenization".into(),
+        ))
+    }
+
+    fn detokenize(
+        &self,
+        _tokens: Vec<i32>,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<String, InferenceError> {
+        Err(InferenceError::Invalid(
+            "this engine does not support native detokenization".into(),
+        ))
+    }
+
     // A client can disappear after generate's final cancellation check but
     // before delivery. Stateless engines need no cleanup at that boundary.
     fn discard_request_state(&mut self) {}
@@ -254,18 +357,24 @@ enum JobRequest {
     Prepare(Box<dyn FnOnce() -> Result<GenerationRequest, InferenceError> + Send>),
     Count(Box<dyn FnOnce() -> Result<Prompt, InferenceError> + Send>),
     Embed(EmbeddingRequest),
+    Tokenize(TokenizeRequest),
+    Detokenize(Vec<i32>),
 }
 
 enum PreparedRequest {
     Generate(GenerationRequest),
     Count(Prompt),
     Embed(EmbeddingRequest),
+    Tokenize(TokenizeRequest),
+    Detokenize(Vec<i32>),
 }
 
 enum JobResult {
     Generated(Generation),
     Count(usize),
     Embedded(EmbeddingResult),
+    Tokenized(Vec<i32>),
+    Detokenized(String),
 }
 
 impl JobRequest {
@@ -275,6 +384,8 @@ impl JobRequest {
             Self::Prepare(prepare) => prepare().map(PreparedRequest::Generate),
             Self::Count(prepare) => prepare().map(PreparedRequest::Count),
             Self::Embed(request) => Ok(PreparedRequest::Embed(request)),
+            Self::Tokenize(request) => Ok(PreparedRequest::Tokenize(request)),
+            Self::Detokenize(tokens) => Ok(PreparedRequest::Detokenize(tokens)),
         }
     }
 }
@@ -410,6 +521,18 @@ impl InferenceService {
                             .map(JobResult::Embedded),
                         false,
                     ),
+                    PreparedRequest::Tokenize(request) => (
+                        engine
+                            .tokenize(request, &|| job.reply.is_closed())
+                            .map(JobResult::Tokenized),
+                        false,
+                    ),
+                    PreparedRequest::Detokenize(tokens) => (
+                        engine
+                            .detokenize(tokens, &|| job.reply.is_closed())
+                            .map(JobResult::Detokenized),
+                        false,
+                    ),
                 };
                 // Embeddings own a separate context. Losing their result, like a
                 // read-only count result, must not invalidate generation state.
@@ -484,6 +607,26 @@ impl InferenceService {
             JobResult::Embedded(result) => Ok(result),
             _ => Err(InferenceError::Internal(
                 "unexpected result for embedding job".into(),
+            )),
+        }
+    }
+
+    pub async fn tokenize(&self, request: TokenizeRequest) -> Result<Vec<i32>, InferenceError> {
+        request.validate()?;
+        match self.submit(JobRequest::Tokenize(request)).await? {
+            JobResult::Tokenized(tokens) => Ok(tokens),
+            _ => Err(InferenceError::Internal(
+                "unexpected result for tokenize job".into(),
+            )),
+        }
+    }
+
+    pub async fn detokenize(&self, tokens: Vec<i32>) -> Result<String, InferenceError> {
+        validate_detokenize(&tokens)?;
+        match self.submit(JobRequest::Detokenize(tokens)).await? {
+            JobResult::Detokenized(content) => Ok(content),
+            _ => Err(InferenceError::Internal(
+                "unexpected result for detokenize job".into(),
             )),
         }
     }
@@ -985,6 +1128,52 @@ impl LlamaEngine {
 }
 
 impl Engine for LlamaEngine {
+    fn tokenize(
+        &self,
+        request: TokenizeRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<i32>, InferenceError> {
+        request.validate()?;
+        ensure_active(cancelled)?;
+        let model = &self.session.borrow_owner().model;
+        let result = model.vocab().tokenize_bounded(
+            request.content.as_bytes(),
+            request.add_special,
+            request.parse_special,
+            TOKENIZER_MAX_TOKENS,
+        );
+        ensure_active(cancelled)?;
+        let tokens = result.map_err(|error| {
+            tokenizer_native_error(error, "tokenizer output exceeds the 128k token limit")
+        })?;
+        Ok(tokens.into_iter().map(|token| token.0).collect())
+    }
+
+    fn detokenize(
+        &self,
+        tokens: Vec<i32>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String, InferenceError> {
+        validate_detokenize(&tokens)?;
+        ensure_active(cancelled)?;
+        let model = &self.session.borrow_owner().model;
+        let vocab = model.vocab();
+        if tokens.iter().any(|&id| id >= vocab.n_tokens()) {
+            return Err(InferenceError::Invalid(
+                "token ID is outside the native vocabulary".into(),
+            ));
+        }
+        // Decode the entire sequence, not individual pieces: a UTF-8 code point
+        // can span tokens. Keep explicit special tokens visible, as llama.cpp does.
+        let tokens: Vec<_> = tokens.into_iter().map(LlamaToken::new).collect();
+        let result = vocab.detokenize_bounded(&tokens, false, true, TOKENIZER_MAX_BYTES);
+        ensure_active(cancelled)?;
+        let bytes = result.map_err(|error| {
+            tokenizer_native_error(error, "detokenized content exceeds the 1 MiB byte limit")
+        })?;
+        tokenizer_utf8(&bytes, TOKENIZER_MAX_BYTES, cancelled)
+    }
+
     fn embed(
         &mut self,
         request: EmbeddingRequest,

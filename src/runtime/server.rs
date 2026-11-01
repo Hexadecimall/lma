@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -114,12 +115,12 @@ pub(crate) async fn build(
     Ok((app, worker))
 }
 
-fn validate_hosting(config: &ServeConfig) -> Result<(), String> {
-    if !matches!(
-        config.api.as_str(),
-        "all" | "openai" | "ollama" | "anthropic"
-    ) {
-        return Err("api must be all, openai, ollama, or anthropic".into());
+pub(super) fn validate_hosting(config: &ServeConfig) -> Result<(), String> {
+    if !crate::config::API_PROFILES.contains(&config.api.as_str()) {
+        return Err(format!(
+            "api must be one of: {}",
+            crate::config::API_PROFILES.join(", ")
+        ));
     }
     if !crate::config::CLIENT_PRESETS.contains(&config.client.as_str()) {
         return Err(format!(
@@ -159,6 +160,22 @@ pub(super) fn router(state: AppState) -> Router {
             .route("/api/show", post(super::ollama::show))
             .route("/api/embed", post(super::embeddings::embed))
             .route("/api/embeddings", post(super::embeddings::legacy));
+    }
+    if matches!(state.api.as_str(), "all" | "llama") {
+        protected = protected
+            .route("/completion", post(super::llama_api::completion))
+            .route("/tokenize", post(super::llama_api::tokenize))
+            .route("/detokenize", post(super::llama_api::detokenize))
+            .route("/props", get(super::llama_api::props));
+    }
+    if matches!(state.api.as_str(), "all" | "lma") {
+        protected = protected
+            .route("/lma/v1/status", get(super::native_api::status))
+            .route("/lma/v1/generate", post(super::native_api::generate))
+            .route(
+                "/lma/v1/chat",
+                post(super::native_api::chat).layer(DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
+            );
     }
     if matches!(state.api.as_str(), "all" | "anthropic") {
         protected = protected
@@ -243,20 +260,56 @@ async fn authorize(
 }
 
 async fn api_help(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "api": state.api,
+    Json(api_info(&state.api))
+}
+
+pub(super) fn api_info(api: &str) -> Value {
+    let mut value = json!({
+        "api": api,
         "health": "/health",
         "models": "/v1/models",
-        "generation": if state.api == "anthropic" { "/v1/messages" } else { "/api/chat" },
-        "compatibility": if state.api == "ollama" {
+        "generation": match api { "anthropic" => "/v1/messages", "llama" => "/completion", "lma" => "/lma/v1/chat", "openai" => "/v1/chat/completions", _ => "/api/chat" },
+        "compatibility": if api == "ollama" {
                     "single hosted model; native text NDJSON (stream defaults true), validated/buffered tool envelopes; tools executed by clients, never by lma; no administration or dynamic model loading; see docs/ollama-api.md"
                 } else {
                     "stateless function tools executed by clients, never by lma; native text SSE, validated/buffered tool envelopes; provider cache/reasoning hints are advisory; no cloud persistence or built-in tools"
                 },
-        "count_tokens": if state.api == "anthropic" {
+        "count_tokens": if api == "anthropic" {
             json!("POST /v1/messages/count_tokens: exact served GGUF chat-template input tokens (text only), not Anthropic's proprietary tokenizer")
         } else { Value::Null }
-    }))
+    });
+    if api == "llama" {
+        value["compatibility"] = json!(
+            "strict llama.cpp native completion/tokenizer subset; text SSE; no slots, FIM or full llama-server parity; see docs/endpoints.md"
+        );
+    } else if api == "lma" {
+        value["compatibility"] = json!(
+            "versioned lma v1 text/image chat and raw generation; optional NDJSON; no tool execution or stored conversations; see docs/endpoints.md"
+        );
+    }
+    if matches!(api, "all" | "llama") {
+        value["llama"] = json!({"completion":"/completion","tokenize":"/tokenize","detokenize":"/detokenize","props":"/props","scope":"documented llama.cpp native subset, not full llama-server parity"});
+    }
+    if matches!(api, "all" | "lma") {
+        value["lma"] = json!({"api_version":1,"status":"/lma/v1/status","generate":"/lma/v1/generate","chat":"/lma/v1/chat","stream_format":"ndjson"});
+    }
+    value
+}
+
+/// Closed route classification shared by the resident router and managed host.
+pub(super) fn api_family(path: &str) -> Option<&'static str> {
+    match path {
+        "/completion" | "/tokenize" | "/detokenize" | "/props" => Some("llama"),
+        "/lma/v1/status" | "/lma/v1/generate" | "/lma/v1/chat" => Some("lma"),
+        "/v1/messages" | "/v1/messages/count_tokens" => Some("anthropic"),
+        "/v1/completions" | "/v1/chat/completions" | "/v1/responses" | "/v1/embeddings" => {
+            Some("openai")
+        }
+        "/api/chat" | "/api/generate" | "/api/embed" | "/api/embeddings" | "/api/version"
+        | "/api/tags" | "/api/ps" | "/api/show" | "/api/pull" | "/api/copy" | "/api/create"
+        | "/api/delete" => Some("ollama"),
+        _ => None,
+    }
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -471,21 +524,60 @@ pub(super) fn validate_chat_text(content: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn prepare_messages(messages: Vec<ChatMessage>) -> Result<Vec<Message>, ApiError> {
+/// Shape/content checks only: image decoding stays inside admitted preparation.
+pub(super) fn validate_chat_messages(messages: &[ChatMessage]) -> Result<(), ApiError> {
     if messages.is_empty() {
         return Err(ApiError::invalid(
             "messages must contain at least one message",
         ));
     }
+    for message in messages {
+        if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
+            return Err(ApiError::invalid(
+                "message role must be system, user, or assistant; tools are not supported",
+            ));
+        }
+        let mut has_images = !message.images.is_empty();
+        let content = match &message.content {
+            ChatContent::Text(text) => Cow::Borrowed(text.as_str()),
+            ChatContent::Parts(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text: part } => text.push_str(part),
+                        ContentPart::ImageUrl { .. } => {
+                            if !text.is_empty() {
+                                return Err(ApiError::invalid(
+                                    "image parts must precede all nonempty text parts; interleaved images after text are not supported",
+                                ));
+                            }
+                            has_images = true;
+                        }
+                    }
+                }
+                Cow::Owned(text)
+            }
+        };
+        // Concatenation also catches reserved markers split across text parts.
+        validate_chat_text(&content)?;
+        if has_images && message.role != "user" {
+            return Err(ApiError::invalid("only user messages may contain images"));
+        }
+        if content.is_empty() && !has_images {
+            return Err(ApiError::invalid(
+                "message content must be nonempty unless it has images",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_messages(messages: Vec<ChatMessage>) -> Result<Vec<Message>, ApiError> {
+    validate_chat_messages(&messages)?;
     let mut budget = ImageBudget::default();
     messages
         .into_iter()
         .map(|message| {
-            if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
-                return Err(ApiError::invalid(
-                    "message role must be system, user, or assistant; tools are not supported",
-                ));
-            }
             // Ollama attachments precede content parts. Inference inserts its own markers.
             let mut images = Vec::new();
             for encoded in message.images {
@@ -499,11 +591,6 @@ fn prepare_messages(messages: Vec<ChatMessage>) -> Result<Vec<Message>, ApiError
                         match part {
                             ContentPart::Text { text: part } => text.push_str(&part),
                             ContentPart::ImageUrl { image_url } => {
-                                if !text.is_empty() {
-                                    return Err(ApiError::invalid(
-                                        "image parts must precede all nonempty text parts; interleaved images after text are not supported",
-                                    ));
-                                }
                                 images.push(budget.data_url(&image_url.url)?);
                             }
                         }
@@ -511,14 +598,6 @@ fn prepare_messages(messages: Vec<ChatMessage>) -> Result<Vec<Message>, ApiError
                     text
                 }
             };
-            // Validate after concatenation to reject reserved markers split across text parts.
-            validate_chat_text(&content)?;
-            if !images.is_empty() && message.role != "user" {
-                return Err(ApiError::invalid("only user messages may contain images"));
-            }
-            if content.is_empty() && images.is_empty() {
-                return Err(ApiError::invalid("message content must be nonempty unless it has images"));
-            }
             Ok(Message {
                 role: message.role,
                 content,
@@ -768,6 +847,60 @@ mod tests {
     use tokio::sync::Notify;
     use tower::ServiceExt;
 
+    #[test]
+    fn chat_preflight_matches_shared_preparation_for_invalid_content() {
+        let mut invalids = vec![
+            json!([]),
+            json!([{"role":"tool","content":"result"}]),
+            json!([{"role":"user","content":""}]),
+            json!([{"role":"user","content":[]}]),
+            json!([{"role":"assistant","content":[{"type":"text","text":""}]}]),
+            json!([{"role":"user","content":"bad\0text"}]),
+            json!([{"role":"user","content":[{"type":"text","text":"bad"},{"type":"text","text":"\0"}]}]),
+            json!([{"role":"system","content":"x","images":["not-base64"]}]),
+            json!([{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"not-a-data-url"}}]}]),
+            json!([{"role":"user","content":[{"type":"text","text":"x"},{"type":"image_url","image_url":{"url":"not-a-data-url"}}]}]),
+        ];
+        for (start, end) in [
+            ("<__", "media__>"),
+            ("<__lma_", "image_0>"),
+            ("<__", "image__>"),
+        ] {
+            invalids.push(json!([{"role":"user","content":format!("{start}{end}")} ]));
+            invalids.push(json!([{"role":"user","content":[{"type":"text","text":start},{"type":"text","text":end}]}]));
+        }
+        for body in invalids {
+            let messages: Vec<ChatMessage> = serde_json::from_value(body.clone()).unwrap();
+            let error = validate_chat_messages(&messages)
+                .err()
+                .expect("invalid chat shape/content");
+            let prepared_error = prepare_messages(messages)
+                .err()
+                .expect("shared preparation must agree");
+            assert_eq!(error.message, prepared_error.message, "{body}");
+        }
+    }
+
+    #[test]
+    fn chat_preflight_accepts_valid_shapes_without_decoding_images() {
+        for body in [
+            json!([{"role":"system","content":"system"},{"role":"user","content":" "},{"role":"assistant","content":"answer"}]),
+            json!([{"role":"user","content":[{"type":"text","text":"hé"},{"type":"text","text":"llo"}]}]),
+            json!([{"role":"user","content":"","images":["not-base64"]}]),
+            json!([{"role":"user","content":[{"type":"text","text":""},{"type":"image_url","image_url":{"url":"not-a-data-url"}},{"type":"text","text":"describe"}]}]),
+        ] {
+            let messages: Vec<ChatMessage> = serde_json::from_value(body.clone()).unwrap();
+            assert!(validate_chat_messages(&messages).is_ok(), "{body}");
+        }
+        let messages =
+            serde_json::from_value(json!([{"role":"user","content":"","images":["not-base64"]}]))
+                .unwrap();
+        let error = prepare_messages(messages)
+            .err()
+            .expect("image decoding remains in preparation");
+        assert!(error.message.contains("base64"));
+    }
+
     const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     const BLUE_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==";
     type Captured = Arc<std::sync::Mutex<Vec<GenerationRequest>>>;
@@ -851,6 +984,100 @@ mod tests {
         let mut state = test_state(inference, None);
         state.model_id = "example:latest".into();
         (router(state), captured, worker)
+    }
+
+    #[tokio::test]
+    #[ignore = "loads one local text model; set LMA_TEST_TEXT_GGUF and optionally LMA_TEST_TEXT_GPU_LAYERS, run alone"]
+    async fn real_native_endpoint_adapters_agree_and_tokenizer_roundtrips() {
+        let model =
+            std::env::var_os("LMA_TEST_TEXT_GGUF").expect("set an existing local GGUF explicitly");
+        let gpu_layers = std::env::var("LMA_TEST_TEXT_GPU_LAYERS")
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(0);
+        let (app, worker) = build(ServeConfig {
+            model: model.into(),
+            model_id: Some("native-endpoints".into()),
+            gpu_layers,
+            memory_fallback: "error".into(),
+            context: 128,
+            batch: 32,
+            micro_batch: 32,
+            threads: 4,
+            flash: "off".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(120),async {
+            let prompt = "Continue counting integers, separated by commas: 1, 2, 3, 4,";
+            let finite_body = |limit:u32|json!({"prompt":prompt,"max_tokens":limit,"temperature":0,"top_p":1,"seed":42});
+            let response = app.clone().oneshot(request("POST","/v1/completions",finite_body(4),None)).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let reference = response_json(response).await;
+            let text = reference["choices"][0]["text"].as_str().unwrap();
+            for (path,body) in [
+                ("/completion",json!({"prompt":prompt,"n_predict":4,"temperature":0,"top_p":1,"seed":42})),
+                ("/lma/v1/generate",finite_body(4)),
+                ("/api/generate",json!({"prompt":prompt,"raw":true,"stream":false,"options":{"num_predict":4,"temperature":0,"top_p":1,"seed":42}})),
+            ] {
+                let response = app.clone().oneshot(request("POST",path,body,None)).await.unwrap();
+                assert_eq!(response.status(),StatusCode::OK,"{path}");
+                let value = response_json(response).await;
+                let actual = match path {"/completion"=> &value["content"],"/api/generate"=> &value["response"],_=> &value["text"]};
+                assert_eq!(actual,text,"{path} raw output");
+            }
+            for (path,mut body) in [
+                ("/completion",json!({"prompt":prompt,"n_predict":4,"temperature":0,"top_p":1,"seed":42})),
+                ("/lma/v1/generate",finite_body(4)),
+            ] {
+                body["stream"]=json!(true);
+                let response = app.clone().oneshot(request("POST",path,body,None)).await.unwrap();
+                assert_eq!(response.status(),StatusCode::OK);
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let wire = std::str::from_utf8(&bytes).unwrap();
+                let frames:Vec<Value> = wire.lines().filter_map(|line| {
+                    let data = if path=="/completion" {line.strip_prefix("data: ")?} else {line};
+                    (!data.is_empty()).then(||serde_json::from_str(data).unwrap())
+                }).collect();
+                let output:String = frames.iter().filter_map(|frame|frame[if path=="/completion" {"content"}else{"text"}].as_str()).collect();
+                assert_eq!(output,text,"{path} streaming output");
+                let final_frame = frames.last().unwrap();
+                let count = if path=="/completion" {&final_frame["tokens_predicted"]} else {&final_frame["usage"]["output_tokens"]};
+                assert_eq!(count,&reference["usage"]["completion_tokens"]);
+            }
+            let remaining = 128-u32::try_from(reference["usage"]["prompt_tokens"].as_u64().unwrap()).unwrap();
+            let reference_full = app.clone().oneshot(request("POST","/v1/completions",finite_body(remaining),None)).await.unwrap();
+            assert_eq!(reference_full.status(),StatusCode::OK);
+            let reference_full = response_json(reference_full).await;
+            for (path,body) in [
+                ("/completion",json!({"prompt":prompt,"n_predict":-1,"temperature":0,"top_p":1,"seed":42})),
+                ("/lma/v1/generate",json!({"prompt":prompt,"max_tokens":null,"temperature":0,"top_p":1,"seed":42})),
+            ] {
+                let response = app.clone().oneshot(request("POST",path,body,None)).await.unwrap();
+                assert_eq!(response.status(),StatusCode::OK);
+                let value = response_json(response).await;
+                assert_eq!(value[if path=="/completion" {"content"}else{"text"}],reference_full["choices"][0]["text"],"{path} remaining-context output");
+                let count = if path=="/completion" {&value["tokens_predicted"]} else {&value["usage"]["output_tokens"]};
+                assert_eq!(count,&reference_full["usage"]["completion_tokens"]);
+            }
+            let original = "Hello, 世界🙂\n";
+            let response = app.clone().oneshot(request("POST","/tokenize",json!({"content":original}),None)).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let tokens = response_json(response).await["tokens"].clone();
+            assert!(!tokens.as_array().unwrap().is_empty());
+            let response = app.clone().oneshot(request("POST","/detokenize",json!({"tokens":tokens}),None)).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            assert_eq!(response_json(response).await["content"],original);
+            for path in ["/props","/lma/v1/status","/health"] {
+                assert_eq!(app.clone().oneshot(request("GET",path,Value::Null,None)).await.unwrap().status(),StatusCode::OK);
+            }
+            let response = app.clone().oneshot(request("POST","/v1/completions",finite_body(1),None)).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK,"same engine remains usable after all endpoint/budget checks");
+        }).await;
+        drop(app);
+        worker.await.unwrap();
+        result.expect("native endpoint regression timed out");
     }
 
     fn model_definition() -> Arc<crate::models::modelfile::Definition> {
@@ -2288,7 +2515,7 @@ mod tests {
 
     fn hosting_body(path: &str) -> Value {
         match path {
-            "/v1/completions" => json!({"prompt":"hello"}),
+            "/v1/completions" | "/completion" | "/lma/v1/generate" => json!({"prompt":"hello"}),
             "/v1/responses" => json!({"model":"test.gguf","input":"hello"}),
             "/v1/messages" => {
                 json!({"model":"test.gguf","max_tokens":16,"messages":[{"role":"user","content":"hello"}]})
@@ -2303,7 +2530,7 @@ mod tests {
 
     #[tokio::test]
     async fn hosting_modes_gate_only_generation_families_and_preserve_utilities() {
-        for api in ["all", "openai", "ollama", "anthropic"] {
+        for &api in crate::config::API_PROFILES {
             let (app, calls, worker) = hosting_app(api, None).await;
             let mut expected_calls = 0;
             for (family, path) in [
@@ -2313,6 +2540,9 @@ mod tests {
                 ("ollama", "/api/chat"),
                 ("ollama", "/api/generate"),
                 ("anthropic", "/v1/messages"),
+                ("llama", "/completion"),
+                ("lma", "/lma/v1/generate"),
+                ("lma", "/lma/v1/chat"),
             ] {
                 let enabled = api == "all" || api == family;
                 let response = app
@@ -2348,12 +2578,21 @@ mod tests {
                                 .unwrap()
                                 .contains("GGUF chat-template")
                         );
-                    } else {
+                    } else if api == "ollama" {
                         assert!(info["count_tokens"].is_null());
                         let compatibility = info["compatibility"].as_str().unwrap();
                         assert!(compatibility.contains("NDJSON"));
                         assert!(compatibility.contains("stream defaults true"));
                         assert!(!compatibility.contains("SSE"));
+                    } else {
+                        assert!(info[api].is_object());
+                        assert!(info["generation"].as_str().unwrap().starts_with(
+                            if api == "llama" {
+                                "/completion"
+                            } else {
+                                "/lma/"
+                            }
+                        ));
                     }
                 }
             }

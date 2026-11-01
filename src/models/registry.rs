@@ -356,6 +356,49 @@ pub fn delete(root: &Path, label: &str) -> Result<(), String> {
     })
 }
 
+/// Remove snapshotted primary references only while both their original and
+/// canonical targets are still missing. Never infer absence from other I/O errors.
+/// Re-read under the mutation lock so concurrent publications and definitions survive.
+pub(super) fn remove_missing(
+    root: &Path,
+    expected: &BTreeMap<String, (Entry, PathBuf)>,
+) -> Result<Vec<String>, String> {
+    fn missing(path: &Path) -> Result<bool, String> {
+        match fs::metadata(path) {
+            Ok(_) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(format!(
+                "cannot revalidate alias target {}: {e}",
+                path.display()
+            )),
+        }
+    }
+    let mut deleted = Vec::new();
+    change_full(root, |entries| {
+        for (label, (previous, target)) in expected {
+            let Some(current) = entries.get(label) else {
+                continue;
+            };
+            if !missing(&current.path)? {
+                continue;
+            }
+            if current.entry() != *previous {
+                return Err(format!(
+                    "registry alias '{label}' changed before cleanup; retry selection"
+                ));
+            }
+            if missing(target)? {
+                deleted.push(label.clone());
+            }
+        }
+        for label in &deleted {
+            entries.remove(label);
+        }
+        Ok(())
+    })?;
+    Ok(deleted)
+}
+
 /// Keep alias sharing checks and staged-file preparation under the same lock as
 /// `put`/`delete`. A returned staging guard rolls files back if registry publication fails.
 pub(super) fn remove_with<T>(
@@ -523,6 +566,62 @@ mod tests {
         assert_eq!(unsafe { mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(put(&root, "new", entry).unwrap_err().contains("lock file"));
         assert!(!location(&root).exists());
+    }
+
+    #[test]
+    fn missing_cleanup_fails_closed_for_changed_missing_entries_and_io_errors() {
+        let (_dir, root, entry, definition) = fixture();
+        put_definition(&root, "alias", entry.clone(), definition.clone()).unwrap();
+        let expected = BTreeMap::from([(
+            "alias:latest".to_owned(),
+            (entry.clone(), entry.path.clone()),
+        )]);
+        fs::remove_file(&entry.path).unwrap();
+        let changed = Entry {
+            path: entry.path.with_file_name("changed.gguf"),
+            projector: None,
+        };
+        change_full(&root, |entries| {
+            entries.insert(
+                "alias:latest".into(),
+                StoredEntry::new(changed.clone(), Some(definition.clone())),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            remove_missing(&root, &expected)
+                .unwrap_err()
+                .contains("changed before cleanup")
+        );
+        assert_eq!(read(&root).unwrap()["alias:latest"], changed);
+        assert_eq!(definition_lookup(&root, "alias"), Some(definition.clone()));
+
+        // An intermediate regular file yields NotADirectory, not NotFound.
+        fs::write(&entry.path, b"GGUFfixture").unwrap();
+        let invalid = Entry {
+            path: entry.path.join("child.gguf"),
+            projector: None,
+        };
+        change_full(&root, |entries| {
+            entries.insert(
+                "alias:latest".into(),
+                StoredEntry::new(invalid.clone(), Some(definition.clone())),
+            );
+            Ok(())
+        })
+        .unwrap();
+        let expected = BTreeMap::from([(
+            "alias:latest".to_owned(),
+            (invalid.clone(), invalid.path.clone()),
+        )]);
+        assert!(
+            remove_missing(&root, &expected)
+                .unwrap_err()
+                .contains("cannot revalidate alias target")
+        );
+        assert_eq!(read(&root).unwrap()["alias:latest"], invalid);
+        assert_eq!(definition_lookup(&root, "alias"), Some(definition));
     }
 
     #[test]

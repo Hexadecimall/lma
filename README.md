@@ -6,23 +6,30 @@ Load local GGUF files or compatible models already installed by Ollama in the de
 
 ## Build and install
 
-### Install CLI + desktop from source
+### Install CLI from source (desktop opt-in)
 
 From a complete checkout, with prerequisites installed:
 
 ```sh
-# macOS / Linux: preview, then build and install for the current user
+# macOS / Linux: preview, then build/install only the CLI for the current user
 sh install/install.sh --dry-run
 sh install/install.sh
+# Optional: build/install CLI + native desktop
+sh install/install.sh --desktop
+# Updates also default to CLI only; add --desktop to update both
+sh install/install.sh --update
 ```
 
 ```powershell
 # Windows (PowerShell)
 powershell -File install/install.ps1 --dry-run
 powershell -File install/install.ps1
+# Optional CLI + desktop installation or update
+powershell -File install/install.ps1 --desktop
+powershell -File install/install.ps1 --update --desktop
 ```
 
-These wrappers use the Python installer to build **both CLI and desktop**, with locked release dependencies, a shared cached `target` directory, and **two Cargo jobs** by default. No elevation, `sudo`, toolchain installation, PATH edits, or model downloads. macOS installs a user-local `~/Applications/lma.app`, ad-hoc signed when `codesign` is available—not Developer ID signed or notarized. macOS desktop enables Metal; Linux/Windows default to CPU, with optional `--cuda` requiring a compatible toolkit.
+These wrappers use the Python installer to build **only the CLI by default**, including `--update`, with locked release dependencies, a shared cached `target` directory, and **two Cargo jobs** by default. `--desktop` explicitly opts into building/installing both components for that invocation; saved or legacy desktop registrations do not opt future runs in. CLI-only runs leave existing desktop apps, bundles and launchers unchanged and need no Tauri/webview dependencies. No elevation, `sudo`, toolchain installation, PATH edits, or model downloads. macOS defaults to Metal; CLI-only `--cpu` omits explicit GPU features but may retain implicit llama Metal on Apple Silicon. Linux/Windows default to CPU, with optional `--cuda` requiring a compatible toolkit. With `--desktop`, macOS requires Metal and installs `~/Applications/lma.app`, ad-hoc signed when `codesign` is available—not Developer ID signed or notarized.
 
 See **[installation, prerequisites, updates, and recovery](install/INSTALL.md)** for platform dependencies, install locations, build controls, and Windows staging. Rust must support **edition 2024**; native builds need a C/C++ compiler, CMake, and **libclang** for bindgen. Desktop additionally needs the platform webview dependencies and, on macOS, a working Metal compiler. Initial dependency downloads and native compilation can take a while.
 
@@ -71,7 +78,8 @@ lma l                                    # Installed models (lma nss list)
 lma lh                                   # Model picker + chat (lma nss launch)
 lma c llama3.2                           # Terminal chat (lma nss chat llama3.2)
 lma t -m models/whisper-tiny audio.wav    # lma nss transcribe -m ... audio.wav
-lma s llama3.2 -c 8k                     # Host an installed model; open localhost:8080
+lma s                                    # Idle server; /api/tags lists installed models
+lma s llama3.2 -c 8k                     # Optional preload; open localhost:8080
 lma s -p model.gguf -g cpu               # Explicit local file and CPU inference
 lma s -p vision.gguf -pr mmproj.gguf
 lma sp                                   # Stop/unload the active model (lma nss stop)
@@ -292,7 +300,13 @@ The app checks update registration first, then cancels active requests and unloa
 
 ## Serve and installed Ollama models
 
-`lma s NAME [OPTIONS]` (or `lma nss serve NAME`) hosts an installed model; root `-m NAME` also selects it. Use root `-p FILE` to explicitly select a local GGUF, including a file whose name collides with an installed model. Positional/`-m` file paths remain accepted; existing local files win. On actual startup, installed names (e.g. `llama3.2`) go through the shared installed-model resolver. Missing absolute, explicitly relative, or `.gguf` paths remain path errors; use `ollama:NAME` to disambiguate.
+`lma s [NAME] [OPTIONS]` (or `lma nss serve [NAME]`) starts a server. With no model,
+it starts **idle**, without a picker or inference initialization. `GET /api/tags`
+lists installed models immediately with the default `all` profile (or `-a ollama`);
+`GET /v1/models` works with every profile, and `/api/ps` is empty until a model is
+loaded. The first generation request must include an installed `model` name;
+later requests can use the resident model. Nothing is downloaded implicitly.
+An explicit `NAME` preloads an installed model; root `-m NAME` also selects it. Use root `-p FILE` to explicitly select a local GGUF, including a file whose name collides with an installed model. Positional/`-m` file paths remain accepted; existing local files win. On actual startup, installed names (e.g. `llama3.2`) go through the shared installed-model resolver. Missing absolute, explicitly relative, or `.gguf` paths remain path errors; use `ollama:NAME` to disambiguate.
 
 - Select explicitly with root `-o NAME` or positional `ollama:llama3.2:latest`. `lma nss serve --ollama NAME` also works; NSS retains its legacy option shortcuts.
 - Store precedence: **root `-or PATH` (NSS `--ollama-dir PATH` / `-od PATH`) > `OLLAMA_MODELS` > `HOME/.ollama/models`** (Windows uses `USERPROFILE`, then `HOME`). Only that store is searched, not broad system locations.
@@ -302,30 +316,30 @@ The app checks update registration first, then cancels active requests and unloa
 - Model IDs use the normalized Ollama name/tag, such as `llama3.2:latest`, not a blob digest. An omitted tag becomes `latest`; local files use their filename.
 - Ollama template, system, and parameter layers are **ignored with a startup warning**. Chat prefers the GGUF template, with automatic compatibility formatting when it is missing/unusable; it does not evaluate Ollama's Go templates/settings.
 - Root `-pr PATH` (NSS `--projector PATH` / `--mmproj PATH`) overrides a discovered projector.
-- Root `-d` (NSS `--dry-run`) with an explicit `ollama:` reference (including `-o`) or a store override (`-or` at root, `--ollama-dir` in NSS) performs resolution, reading manifests and selected blob headers, but **does not load weights**. Explicit `lma:NAME:TAG` previews also resolve the registered definition and its load defaults without loading weights. Ordinary local-file previews remain no-read; plain names without those explicit selectors are not resolved during preview. API keys are redacted.
+- Root `-d` (NSS `--dry-run`) with an explicit `ollama:` reference (including `-o`) or a store override with a supplied model (`-or` at root, `--ollama-dir` in NSS) performs resolution, reading manifests and selected blob headers, but **does not load weights**. Explicit `lma:NAME:TAG` previews also resolve the registered definition and its load defaults without loading weights. Ordinary local-file previews remain no-read; plain names without those explicit selectors are not resolved during preview. API keys are redacted.
 
 ### Server options
 
 These are the canonical root flags for `lma s`, `lma c`, and `lma lh`. The backend recipes and long-option discussion below use **`lma nss serve`**; those long flags are never accepted at root.
 
-| Root flag                 | Meaning / default                                                                                                   |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `-m NAME`, `-p FILE`      | Installed model or explicit local GGUF; positional names also work.                                                 |
-| `-o NAME`, `-or PATH`     | Installed Ollama selector and store override.                                                                       |
-| `-c N`, `-t auto\|N`      | Context tokens (4096; `8k` = 8192; minimum 2) and CPU threads (auto).                                               |
-| `-g all\|cpu\|N`          | Default `all` with compiled Metal/CUDA, otherwise `cpu`; `all` requests 999.                                        |
-| `-b N`, `-mh N`           | Batch (512) and micro-batch (`min(128, batch)`); micro-batch cannot exceed batch.                                   |
-| `-f auto\|on\|off`        | Flash attention; default `auto`.                                                                                    |
-| `-pr PATH`, `-ce NAME`    | Compatible vision projector and chat-template override.                                                             |
-| `-pe`, `-n`               | Enable (default) / disable conservative text-prefix reuse.                                                          |
-| `-k f16\|q8_0\|q4_0`      | KV cache; default `f16`; quantized types require `-f on`.                                                           |
-| `-mk error\|mmap`         | Default `error`; opt-in CPU/pageable-weight fallback below.                                                         |
-| `-e N`                    | Compact MoE slot budget in MiB; GPU when requested, CPU with `-g cpu`; 1..1048576; omitted = off. Not an RSS limit. |
-| `-a FAMILY`, `-ct PRESET` | API family and printed client connection recipe.                                                                    |
-| `-ht HOST`, `-pt PORT`    | Bind address; defaults `127.0.0.1` / 8080.                                                                          |
-| `-ay KEY`                 | Bearer authentication for registered `/v1/*` and `/api/*` routes, including discovery.                              |
-| `-tt TARGET`, `-i`        | Launcher target and interactive setup.                                                                              |
-| `-h`, `-d`                | Help / JSON config preview; dry-run does not load weights or serve.                                                 |
+| Root flag                  | Meaning / default                                                                                                   |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `-m NAME`, `-p FILE`       | Installed model or explicit local GGUF; positional names also work.                                                 |
+| `-o NAME`, `-or PATH`      | Installed Ollama selector and store override.                                                                       |
+| `-c N`, `-t auto\|N`       | Context tokens (4096; `8k` = 8192; minimum 2) and CPU threads (auto).                                               |
+| `-g all\|cpu\|N`           | Default `all` with compiled Metal/CUDA, otherwise `cpu`; `all` requests 999.                                        |
+| `-b N`, `-mh N`            | Batch (512) and micro-batch (`min(128, batch)`); micro-batch cannot exceed batch.                                   |
+| `-f auto\|on\|off`         | Flash attention; default `auto`.                                                                                    |
+| `-pr PATH`, `-ce NAME`     | Compatible vision projector and chat-template override.                                                             |
+| `-pe`, `-n`                | Enable (default) / disable conservative text-prefix reuse.                                                          |
+| `-k f16\|q8_0\|q4_0`       | KV cache; default `f16`; quantized types require `-f on`.                                                           |
+| `-mk error\|mmap`          | Default `error`; opt-in CPU/pageable-weight fallback below.                                                         |
+| `-e N`                     | Compact MoE slot budget in MiB; GPU when requested, CPU with `-g cpu`; 1..1048576; omitted = off. Not an RSS limit. |
+| `-a PROFILE`, `-ct PRESET` | `all\|openai\|ollama\|llama\|lma\|anthropic` and printed client connection recipe.                                  |
+| `-ht HOST`, `-pt PORT`     | Bind address; defaults `127.0.0.1` / 8080.                                                                          |
+| `-ay KEY`                  | Bearer authentication for all protected API routes, including llama/native lma and discovery.                       |
+| `-tt TARGET`, `-i`         | Launcher target and interactive setup.                                                                              |
+| `-h`, `-d`                 | Help / JSON config preview; dry-run does not load weights or serve.                                                 |
 
 Keep loopback binding for local use. Before binding to `0.0.0.0` or another non-loopback address, configure `-ay KEY` (NSS `--api-key KEY`) and external TLS/firewall protection. `/`, `/chat.js`, `/style.css`, and `/health` remain public.
 
@@ -371,9 +385,18 @@ See [performance measurement and the explicit, model-reusing benchmark harness](
 
 ## HTTP API
 
+Choose `all|openai|ollama|llama|lma|anthropic` with root **`lma s MODEL -a PROFILE`** or **`lma nss serve MODEL --api PROFILE`**. Long flags stay NSS-only; there are no new root long aliases. Default `all` enables every family, including the existing Anthropic routes. `/health` and `/v1/models` are shared; `/api/stop` remains shared host control in every profile. Browser chat is available only with `all`/`openai`; other profiles return API information JSON at `/`.
+
+Profiles wrap the **same in-process engine**, not separate servers or faster inference paths. They are supported subsets, **not full llama-server or cloud parity**; no performance claim is made. Existing OpenAI/Ollama contracts are unchanged. See the **[endpoint profiles and native API contract](docs/endpoints.md)** for exact fields, streaming, limits, and base URLs.
+
+- **llama** base URL: `http://127.0.0.1:8080` (not `/v1`). Strict `/completion` supports raw `prompt`, `n_predict` (positive or `-1`, inherited `num_predict`/default 256), `temperature` (alias `temp`), `top_p`, `seed`, and `stream` (default false; true enables SSE). No slots, FIM, `cache_prompt`, or stop controls; unsupported fields are rejected. `/tokenize` uses `content` with `add_special:false` / `parse_special:false`; `/detokenize` uses `tokens:[i32]`. Both use actual model token IDs/vocabulary.
+- **Native lma** base URL: `http://127.0.0.1:8080/lma/v1`. `/generate` takes raw `prompt`; `/chat` uses the existing OpenAI role/content/images schema, without tools or remote image fetching. Both accept optional `model`, `max_tokens`, `temperature`, `top_p`, `seed`, and `stream` (default false). Omitted `max_tokens` inherits stored `num_predict`/default 256; **explicit `null` means remaining context/no reply cap**; zero/negative values are rejected. Nonstream JSON contains `api_version:1`, `id`, `model`, `text`, `usage:{input_tokens,output_tokens}`, and `finish_reason:eos|token_limit|context_limit`. `stream:true` emits NDJSON `start`/`delta`/`done`/`error`; deltas carry text, `done` carries usage/finish without repeating aggregate text. New routes have 1 MiB bodies except native `/lma/v1/chat` (24 MiB).
+
+Printed client presets require their API family to be enabled: an explicit incompatible profile prints a warning, not a usable preset. llama/native-lma URLs are endpoint hints, not OpenAI/Anthropic client compatibility claims. See [client setup](docs/clients.md).
+
 | Endpoint                             | Purpose                                                                |
 | ------------------------------------ | ---------------------------------------------------------------------- |
-| `GET /`                              | Built-in browser chat; public (as are `/chat.js` and `/style.css`).    |
+| `GET /`                              | Public browser chat with all/openai; API info JSON otherwise.          |
 | `GET /health`                        | Ready status; public.                                                  |
 | `GET /v1/models`                     | Installed models plus the explicit startup model.                      |
 | `POST /v1/completions`               | String `prompt` → text; native SSE with `stream:true`.                 |
@@ -388,6 +411,13 @@ See [performance measurement and the explicit, model-reusing benchmark harness](
 | `POST /api/show`                     | Selected installed-model GGUF header information.                      |
 | `GET /api/version`                   | Actual lma version, not an Ollama release number.                      |
 | `POST /api/embed`, `/api/embeddings` | Native normalized vectors; batched or legacy single prompt.            |
+| `GET /props`                         | llama-profile served-model/context properties.                         |
+| `POST /completion`                   | llama-profile raw text completion; optional SSE.                       |
+| `POST /tokenize`, `/detokenize`      | llama-profile actual model token IDs / vocabulary text.                |
+| `GET /lma/v1/status`                 | Native lma API status.                                                 |
+| `POST /lma/v1/generate`              | Native raw text generation; JSON or NDJSON.                            |
+| `POST /lma/v1/chat`                  | Native text/image chat; JSON or NDJSON, no tools.                      |
+| `POST /api/stop`                     | Shared managed-host unload control, in every profile.                  |
 
 ```sh
 curl http://127.0.0.1:8080/v1/models
@@ -399,9 +429,11 @@ curl http://127.0.0.1:8080/api/chat \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false,"options":{"num_predict":64}}'
 ```
 
-With `-ay KEY` (NSS `--api-key KEY`), add `-H 'Authorization: Bearer YOUR_KEY'` to all registered `/v1/*` **and `/api/*`** routes, including discovery. Only Anthropic Messages/count routes also accept `x-api-key`. Route availability follows `-a` (NSS `--api`): `/v1/models` and public `/health` remain shared; Ollama `/api/*` routes require `all` or `ollama`. The CLI HTTP host lists installed models and supports single-resident model selection, keep-alive/unload, public GGUF pull, alias copy/create with stored text definitions, and source-specific deletion, including Ollama and LM Studio. `lma sp` / `lma nss stop` unload from this host. `/api/create` supports the [bounded Modelfile subset](docs/modelfile.md), but HTTP `FROM` accepts installed selectors only, never arbitrary filesystem paths. Push, blob uploads, custom Go templates, adapters and training are not implemented. See [the API contract](docs/ollama-api.md).
+With `-ay KEY` (NSS `--api-key KEY`), add `-H 'Authorization: Bearer YOUR_KEY'` to **all protected API routes**, including `/v1/*`, `/api/*`, llama routes, native `/lma/v1/*`, discovery, and shared `/api/stop`. Only Anthropic Messages/count routes also accept `x-api-key`; `/health` stays public. Route availability follows `-a` (NSS `--api`): `/v1/models` and public `/health` remain shared; Ollama `/api/*` routes require `all` or `ollama` **except shared `/api/stop`**. The CLI HTTP host lists installed models and supports single-resident model selection, keep-alive/unload, public GGUF pull, alias copy/create with stored text definitions, and source-specific deletion, including Ollama and LM Studio. `lma sp` / `lma nss stop` unload from this host. `/api/create` supports the [bounded Modelfile subset](docs/modelfile.md), but HTTP `FROM` accepts installed selectors only, never arbitrary filesystem paths. Push, blob uploads, custom Go templates, adapters and training are not implemented. See [the API contract](docs/ollama-api.md).
 
-Chat accepts `system`, `developer` (mapped to system), `user`, and `assistant` roles, plus matched `tool` results. **A missing chat template no longer blocks chat.** The default root `-ce auto` (NSS `--chat-template auto`) prefers a usable embedded GGUF template, otherwise detects Llama 3, Gemma/Gemma4, ChatML/Phi 4, or Phi 3 signatures using exact special/control tokens, and finally falls back to plain `System:`, `User:`, `Assistant:` conversation formatting. Formatting is shared by desktop, TUI, hosted APIs, and token counting; raw completions remain unchanged. A warning is logged once per model when compatibility formatting is used.
+HTTP generation selects only installed models (or the explicit startup model's ID); unknown model names and filesystem paths never cause implicit downloads or arbitrary file loads. Streaming host leases persist until the response body is done, preventing unsafe model switches/unloads during a stream.
+
+OpenAI chat accepts `system`, `developer` (mapped to system), `user`, and `assistant` roles, plus matched `tool` results. **A missing chat template no longer blocks chat.** The default root `-ce auto` (NSS `--chat-template auto`) prefers a usable embedded GGUF template, otherwise detects Llama 3, Gemma/Gemma4, ChatML/Phi 4, or Phi 3 signatures using exact special/control tokens, and finally falls back to plain `System:`, `User:`, `Assistant:` conversation formatting. Formatting is shared by desktop, TUI, hosted APIs, and token counting; raw completions remain unchanged. A warning is logged once per model when compatibility formatting is used.
 
 Override with root `-ce plain` (NSS `--chat-template plain`), `native` (strict embedded-template-only), the lma `gemma4` unified formatter, or a pinned llama.cpp built-in name such as `chatml`, `llama3`, `gemma`, `mistral-v7`, or `gpt-oss`. For example: `lma c -o MODEL -ce plain`. Explicit choices fail visibly rather than silently switching formats. This removes a metadata limitation, **not model training or architecture limitations**: base/edit models may echo prompts, continue conversations, or ignore instructions/tools; incompatible weight formats are still unsupported.
 

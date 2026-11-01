@@ -137,13 +137,12 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(config["backend"], "cpu")
         self.assertEqual(config["jobs"], 2)
         self.assertEqual((self.home / ".local/bin/lma").read_text(), "new lma")
-        self.assertEqual(
-            (self.home / ".local/bin/lma-desktop").read_text(), "new lma-desktop"
-        )
-        entry = (self.home / "data/applications/org.lma.app.desktop").read_text()
-        self.assertIn('Exec="' + str(self.home), entry)
+        self.assertIs(config["desktop"], False)
+        self.assertEqual(set(config["install_locations"]), {"cli"})
+        self.assertFalse((self.home / ".local/bin/lma-desktop").exists())
+        self.assertFalse((self.home / "data/applications").exists())
         commands = [c for c in self.commands() if c[0] == "cargo"]
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 1)
         for command in commands:
             for flag in ("--locked", "--release", "--no-default-features"):
                 self.assertIn(flag, command)
@@ -151,10 +150,23 @@ class InstallerTests(unittest.TestCase):
                 command[command.index("--target-dir") + 1], str(self.source / "target")
             )
         self.assertIn("vision,image-gen,speech", commands[0])
+        self.assertFalse(any(c[0] == "pkg-config" for c in self.commands()))
+
+    def test_linux_desktop_opt_in(self):
+        self.invoke("--desktop")
+        config = json.loads((self.home / ".lma/source-install.json").read_text())
+        self.assertIs(config["desktop"], True)
+        self.assertEqual(set(config["install_locations"]), {"cli", "desktop", "desktop_entry"})
+        self.assertEqual((self.home / ".local/bin/lma-desktop").read_text(), "new lma-desktop")
+        entry = (self.home / "data/applications/org.lma.app.desktop").read_text()
+        self.assertIn('Exec="' + str(self.home), entry)
+        commands = [c for c in self.commands() if c[0] == "cargo"]
+        self.assertEqual(len(commands), 2)
         self.assertIn("tauri/custom-protocol", commands[1])
+        self.assertTrue(any(c[0] == "pkg-config" for c in self.commands()))
 
     def test_mac_bundle_and_metal(self):
-        self.invoke(system="Darwin")
+        self.invoke("--desktop", system="Darwin")
         app = self.home / "Applications/lma.app"
         self.assertEqual(
             (app / "Contents/MacOS/lma-desktop").read_text(), "new lma-desktop"
@@ -173,7 +185,7 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(len([c for c in commands if c[0] == "codesign"]), 2)
         with self.assertRaisesRegex(RuntimeError, "always enables Metal"):
-            self.invoke("--cpu", system="Darwin")
+            self.invoke("--desktop", "--cpu", system="Darwin")
 
     def test_cuda_and_saved_update_settings(self):
         self.invoke("--cuda", "--jobs", "3")
@@ -183,7 +195,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(["ghx", "pull", "origin"], commands)
         builds = [c for c in commands if c[0] == "cargo"]
         self.assertIn("vision,image-gen,speech,cuda", builds[0])
-        self.assertIn("cuda", builds[1])
+        self.assertEqual(len(builds), 1)
         self.assertEqual(builds[0][builds[0].index("--jobs") + 1], "3")
         self.assertLess(
             commands.index(["ghx", "status"]), commands.index(["ghx", "pull", "origin"])
@@ -227,14 +239,14 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "cargo" for c in self.commands()))
 
     def test_failed_second_build_leaves_existing_install_untouched(self):
-        self.invoke()
+        self.invoke("--desktop")
         cli = self.home / ".local/bin/lma"
         cli.write_text("old cli")
         config = self.home / ".lma/source-install.json"
         original = config.read_bytes()
         with patch.dict(os.environ, {"FAKE_BUILD_FAIL": "lma-desktop"}):
             with self.assertRaisesRegex(RuntimeError, "cargo failed"):
-                self.invoke()
+                self.invoke("--desktop")
         self.assertEqual(cli.read_text(), "old cli")
         self.assertEqual(config.read_bytes(), original)
         self.assertFalse((self.source / "target/.source-install-lock").exists())
@@ -264,7 +276,7 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(list(self.base.glob(".lma-install-*")))
 
     def test_windows_locked_executable_is_staged_and_applied(self):
-        self.invoke(system="Windows")
+        self.invoke("--desktop", system="Windows")
         binary = self.home / "local/lma/bin/lma-desktop.exe"
         binary.write_text("running old desktop")
         original = os.replace
@@ -276,7 +288,7 @@ class InstallerTests(unittest.TestCase):
 
         with patch.object(installer.os, "replace", side_effect=locked):
             with self.assertRaisesRegex(RuntimeError, "--apply-staged"):
-                self.invoke(system="Windows")
+                self.invoke("--desktop", system="Windows")
         self.assertEqual(binary.read_text(), "running old desktop")
         self.assertTrue(
             (self.home / "local/lma/pending-update/lma-desktop.exe").exists()
@@ -286,6 +298,161 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(binary.read_text(), "new lma-desktop")
         self.assertEqual(self.commands(), [])
         self.assertFalse((self.home / "local/lma/pending-update").exists())
+
+    def test_defaults_across_platforms_skip_desktop_checkout_and_tools(self):
+        shutil.rmtree(self.source / "desktop")
+        (self.source / "install/Info.plist").unlink()
+        original = shutil.which
+        def without_webview(tool):
+            return None if tool in ("pkg-config", "codesign") else original(tool)
+        with patch.object(installer.shutil, "which", side_effect=without_webview):
+            for system in ("Linux", "Darwin", "Windows"):
+                with self.subTest(system=system):
+                    if self.log.exists():
+                        self.log.unlink()
+                    self.invoke(system=system)
+                    builds = [c for c in self.commands() if c[0] == "cargo"]
+                    self.assertEqual(len(builds), 1)
+                    self.assertEqual(builds[0][builds[0].index("--bin") + 1], "lma")
+                    self.assertFalse(any(c[0] in ("pkg-config", "codesign") for c in self.commands()))
+                    config = json.loads((self.home / ".lma/source-install.json").read_text())
+                    self.assertIs(config["desktop"], False)
+                    self.assertEqual(set(config["install_locations"]), {"cli"})
+                    self.assertEqual(config["backend"], "metal" if system == "Darwin" else "cpu")
+                    self.assertFalse((self.home / "Applications").exists())
+
+    def test_mac_cli_cpu_and_backend_platform_validation(self):
+        self.invoke("--cpu", system="Darwin")
+        builds = [c for c in self.commands() if c[0] == "cargo"]
+        self.assertEqual(len(builds), 1)
+        self.assertIn("vision,image-gen,speech", builds[0])
+        self.assertNotIn(["xcrun", "--find", "metal"], self.commands())
+        for backend in ("--cpu", "--cuda"):
+            with self.assertRaisesRegex(RuntimeError, "always enables Metal"):
+                self.invoke("--desktop", backend, system="Darwin")
+        for system in ("Linux", "Windows"):
+            with self.assertRaisesRegex(RuntimeError, "Metal is supported only on macOS"):
+                self.invoke("--backend", "metal", system=system)
+
+    def test_cli_runs_and_updates_preserve_old_desktop_and_ignore_saved_opt_in(self):
+        for system in ("Linux", "Darwin", "Windows"):
+            for legacy in (False, True):
+                with self.subTest(system=system, legacy=legacy):
+                    self.invoke("--desktop", "--jobs", "3", system=system)
+                    _, paths = installer.locations(system, self.home, True)
+                    if system == "Darwin":
+                        old = paths["desktop"] / "Contents/MacOS/lma-desktop"
+                    else:
+                        old = paths["desktop"]
+                    old.write_text("keep old desktop")
+                    registration = self.home / ".lma/source-install.json"
+                    if legacy:
+                        saved = json.loads(registration.read_text())
+                        del saved["desktop"]
+                        registration.write_text(json.dumps(saved))
+                    entry = paths.get("desktop_entry")
+                    if entry:
+                        entry.write_text("keep launcher")
+                    for args in (("--update",), ()):
+                        self.log.unlink()
+                        self.invoke(*args, system=system)
+                        self.assertEqual(old.read_text(), "keep old desktop")
+                        if entry:
+                            self.assertEqual(entry.read_text(), "keep launcher")
+                        self.assertEqual(len([c for c in self.commands() if c[0] == "cargo"]), 1)
+                        saved = json.loads(registration.read_text())
+                        self.assertIs(saved["desktop"], False)
+                        self.assertEqual(set(saved["install_locations"]), {"cli"})
+
+    def test_desktop_can_be_opted_into_on_update(self):
+        self.invoke()
+        self.log.unlink()
+        self.invoke("--update", "--desktop")
+        self.assertEqual(len([c for c in self.commands() if c[0] == "cargo"]), 2)
+        self.assertTrue((self.home / ".local/bin/lma-desktop").exists())
+
+    def test_desktop_prerequisites_only_required_on_opt_in(self):
+        original = shutil.which
+        with patch.object(installer.shutil, "which", side_effect=lambda tool: None if tool == "pkg-config" else original(tool)):
+            self.invoke()
+            with self.assertRaisesRegex(RuntimeError, "pkg-config"):
+                self.invoke("--desktop")
+        (self.source / "desktop/Cargo.toml").unlink()
+        self.invoke()
+        with self.assertRaisesRegex(RuntimeError, "desktop/Cargo.toml"):
+            self.invoke("--desktop")
+
+    def test_registration_desktop_requires_exact_boolean(self):
+        self.invoke()
+        registration = self.home / ".lma/source-install.json"
+        saved = json.loads(registration.read_text())
+        self.log.unlink()
+        for value in (None, 0, 1, "false", [], {}):
+            saved["desktop"] = value
+            registration.write_text(json.dumps(saved))
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "desktop must be a boolean"):
+                self.invoke("--update")
+        self.assertEqual(self.commands(), [])
+
+    def test_windows_cli_staging_ignores_stale_desktop_and_apply_overrides(self):
+        self.invoke("--desktop", system="Windows")
+        binary = self.home / "local/lma/bin/lma.exe"
+        desktop = binary.with_name("lma-desktop.exe")
+        desktop.write_text("keep running desktop")
+        pending = self.home / "local/lma/pending-update"
+        pending.mkdir()
+        (pending / "lma-desktop.exe").write_text("stale staged desktop")
+        binary.write_text("running old cli")
+        original = os.replace
+        def locked(source, destination):
+            if Path(destination) == binary and Path(source).name == "new":
+                raise PermissionError("running exe")
+            return original(source, destination)
+        with patch.object(installer.os, "replace", side_effect=locked):
+            with self.assertRaisesRegex(RuntimeError, "--apply-staged"):
+                self.invoke(system="Windows")
+        self.assertEqual(binary.read_text(), "running old cli")
+        self.assertEqual(desktop.read_text(), "keep running desktop")
+        staged = json.loads((pending / "source-install.json").read_text())
+        self.assertIs(staged["desktop"], False)
+        self.assertEqual(set(staged["install_locations"]), {"cli"})
+        self.log.unlink()
+        for args in (("--desktop",), ("--cpu",), ("--cuda",), ("--backend", "cpu"), ("--jobs", "2")):
+            with self.assertRaisesRegex(RuntimeError, "do not override"):
+                self.invoke("--apply-staged", *args, system="Windows")
+        for value in (None, 0, 1, "false", [], {}):
+            changed = dict(staged, desktop=value)
+            (pending / "source-install.json").write_text(json.dumps(changed))
+            with self.assertRaisesRegex(RuntimeError, "desktop must be a boolean"):
+                self.invoke("--apply-staged", system="Windows")
+        (pending / "source-install.json").write_text(json.dumps(staged))
+        (pending / "lma-desktop.exe").unlink()
+        shutil.rmtree(self.source / "desktop")
+        self.invoke("--apply-staged", system="Windows")
+        self.assertEqual(binary.read_text(), "new lma")
+        self.assertEqual(desktop.read_text(), "keep running desktop")
+        self.assertEqual(self.commands(), [])
+        self.assertFalse(pending.exists())
+
+    def test_windows_legacy_staged_registration_requires_both_binaries(self):
+        self.invoke("--desktop", system="Windows")
+        _, paths = installer.locations("Windows", self.home, True)
+        pending = self.home / "local/lma/pending-update"
+        pending.mkdir()
+        registration = self.home / ".lma/source-install.json"
+        saved = json.loads(registration.read_text())
+        del saved["desktop"]
+        (pending / "source-install.json").write_text(json.dumps(saved))
+        (pending / "lma.exe").write_text("staged cli")
+        with self.assertRaisesRegex(RuntimeError, "lma-desktop.exe"):
+            self.invoke("--apply-staged", system="Windows")
+        self.assertEqual(paths["cli"].read_text(), "new lma")
+        (pending / "lma-desktop.exe").write_text("staged desktop")
+        self.log.unlink()
+        self.invoke("--apply-staged", system="Windows")
+        self.assertEqual(paths["cli"].read_text(), "staged cli")
+        self.assertEqual(paths["desktop"].read_text(), "staged desktop")
+        self.assertEqual(self.commands(), [])
 
     def test_lock_and_invalid_jobs(self):
         lock = self.source / "target/.source-install-lock"

@@ -7,7 +7,7 @@
 //! LMA_TEST_EXPERT_CACHE_GPU_LAYERS defaults to 0 (explicit GPU-slot opt-in).
 //! LMA_TEST_EXPERT_CACHE_MICRO_BATCH defaults to 1; use 2..=32 to check prefill.
 //! LMA_TEST_EXPERT_CACHE_LONG_PROMPT adds a prompt spanning several 16-token tiles.
-//! LMA_TEST_TEXT_GPU_LAYERS selects placement for the until-context regression (default CPU).
+//! LMA_TEST_TEXT_GPU_LAYERS selects placement for until-context and tokenizer regressions (default CPU).
 
 use super::*;
 use std::{
@@ -1139,4 +1139,418 @@ fn real_native_expert_history_survives_reload_and_warms_frequent_bundles() {
     drop(second);
     assert!(!deadline());
     eprintln!("history restored and warmed {stats:?}; output unchanged");
+}
+
+fn tokenizer_request(content: &str) -> TokenizeRequest {
+    TokenizeRequest {
+        content: content.into(),
+        add_special: false,
+        parse_special: false,
+    }
+}
+
+#[derive(Default)]
+struct TokenizerFixture {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    discards: Arc<std::sync::atomic::AtomicUsize>,
+    executor: Option<std::thread::ThreadId>,
+    gate: Option<(Arc<tokio::sync::Notify>, std::sync::mpsc::Receiver<()>)>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TokenizerFixture {
+    fn enter(&self, cancelled: &dyn Fn() -> bool) -> Result<(), InferenceError> {
+        use std::sync::atomic::Ordering;
+        if let Some(executor) = self.executor {
+            assert_ne!(std::thread::current().id(), executor);
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some((entered, release)) = &self.gate {
+            entered.notify_one();
+            release.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        self.cancelled.store(cancelled(), Ordering::SeqCst);
+        ensure_active(cancelled)
+    }
+}
+
+impl Engine for TokenizerFixture {
+    fn generate(
+        &mut self,
+        _: GenerationRequest,
+        _: &dyn Fn() -> bool,
+    ) -> Result<Generation, InferenceError> {
+        panic!("raw tokenizer jobs must never generate or format a prompt");
+    }
+
+    fn tokenize(
+        &self,
+        request: TokenizeRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<i32>, InferenceError> {
+        self.enter(cancelled)?;
+        assert_eq!(request.content, "raw 🦀");
+        assert!(request.add_special && request.parse_special);
+        Ok(vec![10, 20, 30])
+    }
+
+    fn detokenize(
+        &self,
+        tokens: Vec<i32>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String, InferenceError> {
+        self.enter(cancelled)?;
+        if tokens != [10, 20, 30] {
+            return Err(InferenceError::Invalid(
+                "token ID is outside the native vocabulary".into(),
+            ));
+        }
+        Ok("raw 🦀".into())
+    }
+
+    fn discard_request_state(&mut self) {
+        self.discards
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn tokenizer_worker_operations_preserve_ids_flags_and_generation_state() {
+    use std::sync::atomic::Ordering;
+    let fixture = TokenizerFixture {
+        executor: Some(std::thread::current().id()),
+        ..Default::default()
+    };
+    let calls = fixture.calls.clone();
+    let discards = fixture.discards.clone();
+    let (service, worker) = InferenceService::spawn(move || Ok(fixture)).await.unwrap();
+    let tokens = service
+        .tokenize(TokenizeRequest {
+            content: "raw 🦀".into(),
+            add_special: true,
+            parse_special: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(tokens, [10, 20, 30]);
+    assert_eq!(service.detokenize(tokens).await.unwrap(), "raw 🦀");
+    assert!(matches!(
+        service.detokenize(vec![i32::MAX]).await,
+        Err(InferenceError::Invalid(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    for tokens in [vec![-1], vec![0; TOKENIZER_MAX_TOKENS + 1]] {
+        assert!(matches!(
+            service.detokenize(tokens).await,
+            Err(InferenceError::Invalid(_))
+        ));
+    }
+    assert!(matches!(
+        service
+            .tokenize(tokenizer_request(&"x".repeat(TOKENIZER_MAX_BYTES + 1)))
+            .await,
+        Err(InferenceError::Invalid(_))
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "invalid input must not reach the worker"
+    );
+    assert_eq!(discards.load(Ordering::SeqCst), 0);
+    drop(service);
+    worker.await.unwrap();
+}
+
+#[test]
+fn tokenizer_input_limits_accept_empty_and_exact_boundaries() {
+    assert!(tokenizer_request("").validate().is_ok());
+    assert!(
+        tokenizer_request(&"x".repeat(TOKENIZER_MAX_BYTES))
+            .validate()
+            .is_ok()
+    );
+    assert!(validate_detokenize(&[]).is_ok());
+    assert!(validate_detokenize(&vec![0; TOKENIZER_MAX_TOKENS]).is_ok());
+}
+
+#[test]
+fn tokenizer_utf8_replacement_growth_is_checked_before_output_allocation() {
+    let valid = "café 🦀\n日本語";
+    assert_eq!(
+        tokenizer_utf8(valid.as_bytes(), valid.len(), &|| false).unwrap(),
+        valid
+    );
+    assert!(matches!(
+        tokenizer_utf8(valid.as_bytes(), valid.len() - 1, &|| false),
+        Err(InferenceError::Invalid(_))
+    ));
+    for bytes in [
+        &b"a\xffb\xc3\xa9"[..],
+        &b"\xf0\x9f\xa6\x80"[..],
+        &b"\xf0\x9f\xa6"[..],
+        &b"\xe1\x80a"[..],
+        &b"\xed\xa0\x80"[..],
+        &b"\xef\xbb\xbfhello"[..],
+        &b"\x80\x80\x80"[..],
+        &b""[..],
+    ] {
+        let expected = String::from_utf8_lossy(bytes);
+        assert_eq!(
+            tokenizer_utf8(bytes, expected.len(), &|| false).unwrap(),
+            expected
+        );
+        if !expected.is_empty() {
+            assert!(matches!(
+                tokenizer_utf8(bytes, expected.len() - 1, &|| false),
+                Err(InferenceError::Invalid(_))
+            ));
+        }
+    }
+    let invalid = vec![0xff; TOKENIZER_MAX_BYTES];
+    assert!(matches!(
+        tokenizer_utf8(&invalid, TOKENIZER_MAX_BYTES, &|| false),
+        Err(InferenceError::Invalid(_))
+    ));
+    assert!(tokenizer_utf8(&[], 0, &|| true).is_err());
+    let checks = Cell::new(0);
+    assert!(
+        tokenizer_utf8(b"a\xffb", 5, &|| {
+            checks.set(checks.get() + 1);
+            checks.get() >= 2
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn tokenizer_native_resource_errors_preserve_client_and_internal_error_categories() {
+    for error in [
+        BoundedVocabError::OutputTooLarge,
+        BoundedVocabError::InvalidToken,
+        BoundedVocabError::InputTooLarge,
+    ] {
+        assert!(matches!(
+            tokenizer_native_error(error, "bounded output limit"),
+            InferenceError::Invalid(_)
+        ));
+    }
+    for error in [
+        BoundedVocabError::AllocationFailed,
+        BoundedVocabError::InvalidNativeResult,
+    ] {
+        assert!(matches!(
+            tokenizer_native_error(error, "bounded output limit"),
+            InferenceError::Internal(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn tokenizer_default_methods_are_explicitly_unsupported_without_generation() {
+    struct Unsupported;
+    impl Engine for Unsupported {
+        fn generate(
+            &mut self,
+            _: GenerationRequest,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            panic!("unsupported tokenizer must not fall back to generation");
+        }
+        fn discard_request_state(&mut self) {
+            panic!("tokenizer must not discard generation state");
+        }
+    }
+    let (service, worker) = InferenceService::spawn(|| Ok(Unsupported)).await.unwrap();
+    assert!(
+        matches!(service.tokenize(tokenizer_request("")).await, Err(InferenceError::Invalid(message)) if message.contains("does not support native tokenization"))
+    );
+    assert!(
+        matches!(service.detokenize(Vec::new()).await, Err(InferenceError::Invalid(message)) if message.contains("does not support native detokenization"))
+    );
+    drop(service);
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn tokenizer_cancelled_operations_hold_shared_admission_until_native_exit() {
+    use std::sync::atomic::Ordering;
+    for tokenize in [true, false] {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, receive) = std::sync::mpsc::channel();
+        let fixture = TokenizerFixture {
+            gate: Some((entered.clone(), receive)),
+            ..Default::default()
+        };
+        let discards = fixture.discards.clone();
+        let cancelled = fixture.cancelled.clone();
+        let (service, worker) = InferenceService::spawn(move || Ok(fixture)).await.unwrap();
+        let pending = tokio::spawn({
+            let service = service.clone();
+            async move {
+                if tokenize {
+                    service
+                        .tokenize(TokenizeRequest {
+                            content: "raw 🦀".into(),
+                            add_special: true,
+                            parse_special: true,
+                        })
+                        .await
+                        .map(|_| ())
+                } else {
+                    service.detokenize(vec![10, 20, 30]).await.map(|_| ())
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.generate(text_request("x")).await,
+            Err(InferenceError::Busy)
+        ));
+        pending.abort();
+        let _ = pending.await;
+        assert!(matches!(
+            service.detokenize(Vec::new()).await,
+            Err(InferenceError::Busy)
+        ));
+        assert!(matches!(
+            service.tokenize(tokenizer_request("")).await,
+            Err(InferenceError::Busy)
+        ));
+        release.send(()).unwrap();
+        // Admission is private to this module; it stays owned by the worker even
+        // after the receiving HTTP future has been dropped.
+        let permit = tokio::time::timeout(Duration::from_secs(5), service.admission.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(discards.load(Ordering::SeqCst), 0);
+        drop(service);
+        worker.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn tokenizer_abandoned_queued_job_never_reaches_native_operation() {
+    use std::sync::atomic::Ordering;
+    let fixture = TokenizerFixture::default();
+    let calls = fixture.calls.clone();
+    let (service, worker) = InferenceService::spawn(move || Ok(fixture)).await.unwrap();
+    for request in [
+        JobRequest::Tokenize(tokenizer_request("")),
+        JobRequest::Detokenize(vec![]),
+    ] {
+        let (reply, receive) = oneshot::channel();
+        drop(receive);
+        service.enqueue(request, JobReply::Single(reply)).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(5), service.admission.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(service);
+    worker.await.unwrap();
+}
+
+#[test]
+#[ignore = "loads one real local model; coordinate first, set LMA_TEST_TEXT_GGUF or LMA_TEST_OLLAMA_MODEL and run alone"]
+fn tokenizer_real_native_vocabulary_roundtrip_without_generation_or_template() {
+    let (model, model_id) = explicit_native_text_model();
+    let engine = LlamaEngine::load(ServeConfig {
+        model,
+        model_id,
+        context: 64,
+        batch: 32,
+        micro_batch: 32,
+        gpu_layers: native_test_u32_env("LMA_TEST_TEXT_GPU_LAYERS", 0),
+        memory_fallback: "error".into(),
+        chat_template: "plain".into(),
+        flash: "off".into(),
+        ..ServeConfig::default()
+    })
+    .unwrap();
+    let owner = engine.session.borrow_owner();
+    let vocab = owner.model.vocab();
+    let raw = "Hello, café 🦀\n日本語";
+    for (add_special, parse_special) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let expected = vocab.tokenize(raw.as_bytes(), add_special, parse_special);
+        let tokens = engine
+            .tokenize(
+                TokenizeRequest {
+                    content: raw.into(),
+                    add_special,
+                    parse_special,
+                },
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(
+            tokens,
+            expected.iter().map(|token| token.0).collect::<Vec<_>>()
+        );
+        let decoded = engine.detokenize(tokens, &|| false).unwrap();
+        assert_eq!(
+            decoded,
+            String::from_utf8_lossy(&vocab.detokenize(&expected, false, true))
+        );
+        if !add_special {
+            assert_eq!(decoded, raw);
+        }
+    }
+    assert!(
+        engine
+            .tokenize(tokenizer_request(""), &|| false)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.detokenize(vec![], &|| false).unwrap(), "");
+    for remove_special in [false, true] {
+        for unparse_special in [false, true] {
+            assert!(
+                vocab
+                    .detokenize(&[], remove_special, unparse_special)
+                    .is_empty()
+            );
+            assert!(
+                vocab
+                    .detokenize_bounded(&[], remove_special, unparse_special, 0)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+    let tokens = vocab.tokenize(raw.as_bytes(), false, false);
+    assert!(matches!(
+        vocab.detokenize_bounded(&tokens, false, true, 0),
+        Err(BoundedVocabError::OutputTooLarge)
+    ));
+    assert!(matches!(
+        vocab.detokenize_bounded(&[LlamaToken::new(-1)], false, true, 32),
+        Err(BoundedVocabError::InvalidToken)
+    ));
+    assert!(matches!(
+        vocab.tokenize_bounded(raw.as_bytes(), false, false, 0),
+        Err(BoundedVocabError::OutputTooLarge)
+    ));
+    assert!(matches!(
+        engine.detokenize(vec![-1], &|| false),
+        Err(InferenceError::Invalid(_))
+    ));
+    assert!(matches!(
+        engine.detokenize(vec![vocab.n_tokens()], &|| false),
+        Err(InferenceError::Invalid(_))
+    ));
+    assert!(engine.tokenize(tokenizer_request(raw), &|| true).is_err());
+    assert!(engine.detokenize(vec![0], &|| true).is_err());
+    engine.session.with_dependent(|_, session| {
+        assert!(session.cached_prompt.is_empty());
+        assert!(session.embedding.is_none());
+    });
+    assert!(std::ptr::eq(owner, engine.session.borrow_owner()));
 }

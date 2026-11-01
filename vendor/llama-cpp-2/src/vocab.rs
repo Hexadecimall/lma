@@ -23,6 +23,55 @@ pub struct LlamaVocab<'model> {
     _phantom: PhantomData<&'model LlamaModel>,
 }
 
+/// A bounded vocabulary operation could not produce a valid result within its limits.
+#[derive(thiserror::Error, Debug, Eq, PartialEq)]
+pub enum BoundedVocabError {
+    /// The input length or output capacity cannot be represented by the native API.
+    #[error("vocabulary input or output capacity exceeds the native size limit")]
+    InputTooLarge,
+    /// An input token ID is outside this vocabulary.
+    #[error("token ID is outside the native vocabulary")]
+    InvalidToken,
+    /// Native output did not fit in the caller's fixed output capacity.
+    #[error("vocabulary output exceeds the configured limit")]
+    OutputTooLarge,
+    /// The fixed output allocation could not be made.
+    #[error("cannot allocate the bounded vocabulary output buffer")]
+    AllocationFailed,
+    /// Native code returned a written length beyond the supplied buffer.
+    #[error("native vocabulary returned an invalid output length")]
+    InvalidNativeResult,
+}
+
+// Never retry with a native-reported required size. Pass only the requested
+// capacity even if the allocator provides more spare storage.
+// SAFETY: On a nonnegative in-bounds result, `native` must have initialized
+// that many elements at the start of the supplied buffer.
+unsafe fn bounded_vocab_output<T>(
+    limit: usize,
+    native: impl FnOnce(&mut [MaybeUninit<T>]) -> i32,
+) -> Result<Vec<T>, BoundedVocabError> {
+    if limit > i32::MAX as usize {
+        return Err(BoundedVocabError::InputTooLarge);
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(limit)
+        .map_err(|_| BoundedVocabError::AllocationFailed)?;
+    let written = native(&mut output.spare_capacity_mut()[..limit]);
+    if written < 0 {
+        return Err(BoundedVocabError::OutputTooLarge);
+    }
+    let written = written as usize;
+    if written > limit {
+        return Err(BoundedVocabError::InvalidNativeResult);
+    }
+    // SAFETY: The native callback initializes exactly the nonnegative number
+    // of elements it reports, and that count was checked against the buffer.
+    unsafe { output.set_len(written) };
+    Ok(output)
+}
+
 // SAFETY: The vocabulary is immutable.
 unsafe impl Send for LlamaVocab<'_> {}
 // SAFETY: Same as above.
@@ -226,6 +275,28 @@ impl<'model> LlamaVocab<'model> {
         output
     }
 
+    /// Tokenize with a fixed output capacity, without an unbounded resize/retry.
+    ///
+    /// This has the same special-token semantics as [`Self::tokenize`]. Native
+    /// tokenizer working storage is separate and scales with the input text.
+    pub fn tokenize_bounded(
+        &self,
+        text: &[u8],
+        add_special: bool,
+        parse_special: bool,
+        max_tokens: usize,
+    ) -> Result<Vec<LlamaToken>, BoundedVocabError> {
+        if text.len() > i32::MAX as usize {
+            return Err(BoundedVocabError::InputTooLarge);
+        }
+        // SAFETY: tokenize_raw reports the number of initialized output tokens.
+        unsafe {
+            bounded_vocab_output(max_tokens, |buffer| {
+                self.tokenize_raw(text, buffer, add_special, parse_special)
+            })
+        }
+    }
+
     /// Tokenize text into a user-provided buffer.
     ///
     /// The output is placed into the vector's spare capacity, and the `Vec`
@@ -318,10 +389,47 @@ impl<'model> LlamaVocab<'model> {
         remove_special: bool,
         unparse_special: bool,
     ) -> Vec<u8> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
         let tokens_estimation = std::cmp::max(8, (tokens.len() * 2) - usize::from(remove_special));
         let mut output = Vec::with_capacity(tokens_estimation);
         self.detokenize_into(tokens, &mut output, remove_special, unparse_special);
         output
+    }
+
+    /// Detokenize a complete sequence with at most `max_bytes` of output storage.
+    ///
+    /// Preserves native sequence-level leading-space and cleanup semantics, just
+    /// like [`Self::detokenize`]. An oversized result is rejected, never retried
+    /// with a larger allocation. Token IDs are validated before entering native
+    /// code. Empty input returns empty output without allocation or native work.
+    pub fn detokenize_bounded(
+        &self,
+        tokens: &[LlamaToken],
+        remove_special: bool,
+        unparse_special: bool,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, BoundedVocabError> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if tokens.len() > i32::MAX as usize {
+            return Err(BoundedVocabError::InputTooLarge);
+        }
+        let n_tokens = self.n_tokens();
+        if tokens
+            .iter()
+            .any(|token| token.0 < 0 || token.0 >= n_tokens)
+        {
+            return Err(BoundedVocabError::InvalidToken);
+        }
+        // SAFETY: detokenize_raw reports the number of initialized output bytes.
+        unsafe {
+            bounded_vocab_output(max_bytes, |buffer| {
+                self.detokenize_raw(tokens, buffer, remove_special, unparse_special)
+            })
+        }
     }
 
     /// Detokenize a list of tokens into a user-provided buffer.
@@ -570,6 +678,66 @@ pub enum LlamaTokenTypeFromIntError {
     /// The value is not a valid `llama_token_type`. Contains the int value that was invalid.
     #[error("Unknown Value {0}")]
     UnknownValue(llama_cpp_sys_2::llama_vocab_type),
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_capacity_accepts_exact_and_empty_native_results() {
+        // SAFETY: The callback initializes exactly the three reported bytes.
+        let output = unsafe {
+            bounded_vocab_output(3, |buffer| {
+                assert_eq!(buffer.len(), 3);
+                for (slot, value) in buffer.iter_mut().zip([1_u8, 2, 3]) {
+                    slot.write(value);
+                }
+                3
+            })
+        }
+        .unwrap();
+        assert_eq!(output, [1, 2, 3]);
+        // SAFETY: A zero result requires no initialized output.
+        let empty: Vec<u8> = unsafe {
+            bounded_vocab_output(0, |buffer| {
+                assert!(buffer.is_empty());
+                0
+            })
+        }
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn oversized_and_invalid_native_results_never_retry_or_publish_output() {
+        for reported in [-1, -1_000_000_000, i32::MIN] {
+            let mut calls = 0;
+            // SAFETY: Negative results publish no initialized output.
+            let output = unsafe {
+                bounded_vocab_output::<u8>(4, |buffer| {
+                    calls += 1;
+                    assert_eq!(buffer.len(), 4);
+                    buffer[0].write(42);
+                    reported
+                })
+            };
+            assert_eq!(output, Err(BoundedVocabError::OutputTooLarge));
+            assert_eq!(calls, 1);
+        }
+        // SAFETY: Out-of-bounds results are rejected before output is published;
+        // an unrepresentable capacity is rejected without invoking the callback.
+        unsafe {
+            assert_eq!(
+                bounded_vocab_output::<u8>(4, |_| 5),
+                Err(BoundedVocabError::InvalidNativeResult)
+            );
+            assert_eq!(
+                bounded_vocab_output::<u8>(usize::MAX, |_| panic!("must not call native")),
+                Err(BoundedVocabError::InputTooLarge)
+            );
+        }
+    }
 }
 
 impl TryFrom<llama_cpp_sys_2::llama_vocab_type> for VocabType {

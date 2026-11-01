@@ -51,7 +51,16 @@ struct SourceConfig {
     source_dir: PathBuf,
     backend: String,
     jobs: u32,
+    #[serde(default, deserialize_with = "deserialize_desktop")]
+    desktop: Option<bool>,
     install_locations: HashMap<String, PathBuf>,
+}
+
+// Missing means legacy both-component metadata; an explicit null is not a bool.
+fn deserialize_desktop<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 fn regular_file(path: &Path) -> Result<(), String> {
@@ -100,6 +109,7 @@ fn read_config(config_dir: &Path) -> Result<SourceConfig, String> {
     }
     let backend_ok = if cfg!(target_os = "macos") {
         config.backend == "metal"
+            || (config.desktop == Some(false) && matches!(config.backend.as_str(), "cpu" | "cuda"))
     } else {
         matches!(config.backend.as_str(), "cpu" | "cuda")
     };
@@ -116,13 +126,12 @@ fn read_config(config_dir: &Path) -> Result<SourceConfig, String> {
             "Registered source path is not canonical; reinstall from the intended checkout".into(),
         );
     }
-    if !["cli", "desktop"]
-        .iter()
-        .all(|key| config.install_locations.contains_key(*key))
+    if !config.install_locations.contains_key("cli")
+        || (config.desktop != Some(false) && !config.install_locations.contains_key("desktop"))
         || config.install_locations.values().any(|p| !p.is_absolute())
     {
         return Err(
-            "Source registration requires absolute cli and desktop install locations".into(),
+            "Source registration requires absolute cli and, unless desktop is false, desktop install locations".into(),
         );
     }
     directory(&config.source_dir.join("install"))?;
@@ -141,7 +150,7 @@ fn read_config(config_dir: &Path) -> Result<SourceConfig, String> {
 
 fn validate_update_config(config_dir: &Path) -> Result<SourceConfig, String> {
     if cfg!(target_os = "windows") {
-        Err("Windows source updates are external: close lma-desktop and lma, then run install/install.ps1 --update in your registered checkout. If binaries are staged, close the app and run --apply-staged. Restart manually.".into())
+        Err("Windows source updates are external: close lma-desktop and lma, then run install/install.ps1 --update --desktop in your registered checkout. If binaries are staged, close the app and run --apply-staged. Restart manually.".into())
     } else if cfg!(any(target_os = "macos", target_os = "linux")) {
         read_config(config_dir)
     } else {
@@ -276,7 +285,9 @@ impl SourceUpdater {
         let mut child = Command::new("sh")
             .arg(config.source_dir.join("install/install.sh"))
             .arg("--update")
-            .arg("--backend").arg(config.backend)
+            .arg("--desktop")
+            // A CLI-only macOS registration can select CPU, but the GUI needs Metal.
+            .arg("--backend").arg(if cfg!(target_os = "macos") { "metal".into() } else { config.backend })
             .arg("--jobs").arg(config.jobs.to_string())
             .arg("--config-dir").arg(config_dir)
             .current_dir(config.source_dir)
@@ -378,6 +389,21 @@ mod tests {
             .unwrap();
             Self(path)
         }
+        fn components(&self, desktop: Option<bool>) {
+            let path = self.config().join(CONFIG_NAME);
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if let Some(desktop) = desktop {
+                config["desktop"] = serde_json::json!(desktop);
+                if !desktop {
+                    config["install_locations"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("desktop");
+                }
+            }
+            fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        }
         fn config(&self) -> PathBuf {
             self.0.join("config")
         }
@@ -414,6 +440,41 @@ mod tests {
     }
 
     #[test]
+    fn validates_legacy_both_and_cli_only_registrations() {
+        for desktop in [None, Some(true), Some(false)] {
+            let fixture = Fixture::new("exit 0\n");
+            fixture.components(desktop);
+            let config = read_config(&fixture.config()).unwrap();
+            assert_eq!(config.desktop, desktop);
+            let path = fixture.config().join(CONFIG_NAME);
+            let original: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            for key in ["cli", "desktop"] {
+                for value in [None, Some(serde_json::json!("relative"))] {
+                    let mut changed = original.clone();
+                    let locations = changed["install_locations"].as_object_mut().unwrap();
+                    if let Some(value) = value {
+                        locations.insert(key.into(), value);
+                    } else {
+                        locations.remove(key);
+                    }
+                    fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+                    assert_eq!(
+                        read_config(&fixture.config()).is_ok(),
+                        desktop == Some(false)
+                            && key == "desktop"
+                            && !changed["install_locations"]
+                                .as_object()
+                                .unwrap()
+                                .contains_key(key),
+                        "desktop={desktop:?}, invalid location={key}: {changed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rejects_invalid_schema_jobs_paths_and_unknown_fields() {
         let fixture = Fixture::new("exit 0\n");
         let path = fixture.config().join(CONFIG_NAME);
@@ -426,6 +487,12 @@ mod tests {
             ("backend", serde_json::json!("arbitrary")),
             ("source_dir", serde_json::json!("relative/path")),
             ("command", serde_json::json!("not allowed")),
+            ("desktop", serde_json::json!(null)),
+            ("desktop", serde_json::json!(0)),
+            ("desktop", serde_json::json!(1)),
+            ("desktop", serde_json::json!("false")),
+            ("desktop", serde_json::json!([])),
+            ("desktop", serde_json::json!({})),
             (
                 "install_locations",
                 serde_json::json!({"cli": "relative", "desktop": "relative"}),
@@ -479,6 +546,45 @@ mod tests {
         wait(&updater);
         assert_eq!(updater.status().state, "Completed");
         assert!(updater.status().log.contains("Restart"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_gui_update_always_requests_desktop() {
+        for desktop in [None, Some(true), Some(false)] {
+            let fixture = Fixture::new("printf '%s\\n' \"$@\" > arguments\n");
+            fixture.components(desktop);
+            if desktop == Some(false) {
+                let path = fixture.config().join(CONFIG_NAME);
+                let mut config: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                config["backend"] = serde_json::json!("cpu");
+                fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+            }
+            let updater = SourceUpdater::default();
+            updater.start(fixture.config()).unwrap();
+            wait(&updater);
+            assert_eq!(updater.status().state, "Completed");
+            let arguments = fs::read_to_string(fixture.0.join("arguments")).unwrap();
+            let backend = if cfg!(target_os = "macos") {
+                "metal"
+            } else {
+                "cpu"
+            };
+            assert_eq!(
+                arguments.lines().collect::<Vec<_>>(),
+                vec![
+                    "--update",
+                    "--desktop",
+                    "--backend",
+                    backend,
+                    "--jobs",
+                    "2",
+                    "--config-dir",
+                    fixture.config().to_str().unwrap(),
+                ]
+            );
+        }
     }
 
     #[cfg(unix)]
