@@ -15,6 +15,7 @@ mod llama_api;
 mod native_api;
 mod ollama;
 mod openai;
+mod openai_files;
 pub mod quantize;
 pub mod server;
 // Candidate-history prototype only; verified batched decoding is not integrated.

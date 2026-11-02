@@ -26,7 +26,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::generation_controls::{GenerationControls, StopFilter};
+use super::generation_controls::{GenerationControls, OutputBudget, StopFilter, diagnostic_bytes};
 use crate::config::{ServeConfig, backend_report};
 
 #[cfg(feature = "vision")]
@@ -36,21 +36,24 @@ mod vision;
 #[derive(Debug)]
 pub(super) enum InferenceError {
     Invalid(String),
+    ResourceLimit(String),
     Internal(String),
     Busy,
     Unavailable,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Message {
     pub role: String,
     pub content: String,
     pub images: Vec<Vec<u8>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum Prompt {
     Text(String),
+    /// Exact native vocabulary IDs: never add special tokens or apply templates.
+    Tokens(Vec<i32>),
     Chat(Vec<Message>),
     Controls {
         prompt: Box<Prompt>,
@@ -80,6 +83,30 @@ impl Prompt {
         }
     }
 
+    pub(super) fn with_output_budget(mut self, budget: OutputBudget) -> Self {
+        let mut target = &mut self;
+        loop {
+            match target {
+                Self::Controls { controls, .. } => {
+                    controls.output_budget = Some(budget);
+                    break;
+                }
+                Self::Constrained { prompt, .. } | Self::RequestSystem { prompt, .. } => {
+                    target = prompt;
+                }
+                _ => {
+                    let prompt = std::mem::replace(target, Self::Text(String::new()));
+                    *target = prompt.with_controls(GenerationControls {
+                        output_budget: Some(budget),
+                        ..Default::default()
+                    });
+                    break;
+                }
+            }
+        }
+        self
+    }
+
     // The outer controls are the request contract, like the outer schema.
     fn generation_controls(&self) -> Option<&GenerationControls> {
         match self {
@@ -98,9 +125,19 @@ impl Prompt {
         }
     }
 
+    fn token_ids(&self) -> Option<&[i32]> {
+        match self {
+            Self::Tokens(tokens) => Some(tokens),
+            Self::Constrained { prompt, .. }
+            | Self::RequestSystem { prompt, .. }
+            | Self::Controls { prompt, .. } => prompt.token_ids(),
+            Self::Text(_) | Self::Chat(_) => None,
+        }
+    }
+
     fn has_images(&self) -> bool {
         match self {
-            Self::Text(_) => false,
+            Self::Text(_) | Self::Tokens(_) => false,
             Self::Chat(messages) => messages.iter().any(|message| !message.images.is_empty()),
             Self::Constrained { prompt, .. }
             | Self::RequestSystem { prompt, .. }
@@ -121,7 +158,7 @@ impl Prompt {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Options {
     /// Trusted in-process generation only; public API limits are still validated.
     pub until_context: bool,
@@ -152,18 +189,36 @@ impl Options {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct GenerationRequest {
     pub prompt: Prompt,
     pub options: Options,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Generation {
     pub text: String,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub finish_reason: &'static str,
+    pub logprobs: Option<Vec<TokenLogprob>>,
+    /// Mean over all sampled tokens, including EOG and suppressed stops.
+    pub mean_logprob: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct TokenLogprob {
+    pub token: String,
+    pub bytes: Vec<u8>,
+    pub logprob: f64,
+    pub top_logprobs: Vec<TokenAlternative>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct TokenAlternative {
+    pub token: String,
+    pub bytes: Vec<u8>,
+    pub logprob: f64,
 }
 
 /// Raw text only: embeddings never apply a chat template or generate text.
@@ -316,6 +371,17 @@ pub(super) enum GenerationEvent {
     Finished(Result<Generation, InferenceError>),
 }
 
+pub(super) enum BatchGenerationEvent {
+    Delta {
+        index: usize,
+        text: String,
+    },
+    Finished {
+        index: usize,
+        result: Result<Generation, InferenceError>,
+    },
+}
+
 // Bound both queued text and outstanding worker work, even for a stalled client.
 const STREAM_CAPACITY: usize = 16;
 
@@ -397,6 +463,7 @@ pub(super) trait Engine: Send + 'static {
 enum JobRequest {
     Ready(GenerationRequest),
     Prepare(Box<dyn FnOnce() -> Result<GenerationRequest, InferenceError> + Send>),
+    Batch(Box<dyn FnOnce() -> Result<Vec<GenerationRequest>, InferenceError> + Send>),
     Count(Box<dyn FnOnce() -> Result<Prompt, InferenceError> + Send>),
     Embed(EmbeddingRequest),
     Tokenize(TokenizeRequest),
@@ -405,6 +472,7 @@ enum JobRequest {
 
 enum PreparedRequest {
     Generate(GenerationRequest),
+    Batch(Vec<GenerationRequest>),
     Count(Prompt),
     Embed(EmbeddingRequest),
     Tokenize(TokenizeRequest),
@@ -413,6 +481,7 @@ enum PreparedRequest {
 
 enum JobResult {
     Generated(Generation),
+    Batch(Vec<Generation>),
     Count(usize),
     Embedded(EmbeddingResult),
     Tokenized(Vec<i32>),
@@ -424,6 +493,15 @@ impl JobRequest {
         match self {
             Self::Ready(request) => Ok(PreparedRequest::Generate(request)),
             Self::Prepare(prepare) => prepare().map(PreparedRequest::Generate),
+            Self::Batch(prepare) => {
+                let requests = prepare()?;
+                if requests.is_empty() || requests.len() > 128 {
+                    return Err(InferenceError::Invalid(
+                        "generation batch must contain between 1 and 128 choices".into(),
+                    ));
+                }
+                Ok(PreparedRequest::Batch(requests))
+            }
             Self::Count(prepare) => prepare().map(PreparedRequest::Count),
             Self::Embed(request) => Ok(PreparedRequest::Embed(request)),
             Self::Tokenize(request) => Ok(PreparedRequest::Tokenize(request)),
@@ -435,6 +513,7 @@ impl JobRequest {
 enum JobReply {
     Single(oneshot::Sender<(Result<JobResult, InferenceError>, OwnedSemaphorePermit)>),
     Stream(mpsc::Sender<GenerationEvent>),
+    BatchStream(mpsc::Sender<BatchGenerationEvent>),
 }
 
 impl JobReply {
@@ -442,6 +521,7 @@ impl JobReply {
         match self {
             Self::Single(reply) => reply.is_closed(),
             Self::Stream(reply) => reply.is_closed(),
+            Self::BatchStream(reply) => reply.is_closed(),
         }
     }
 
@@ -454,6 +534,25 @@ impl JobReply {
     ) -> Result<(), OwnedSemaphorePermit> {
         match self {
             Self::Single(reply) => reply.send((result, permit)).map_err(|(_, permit)| permit),
+            Self::BatchStream(reply) => {
+                // Successful per-choice terminal events are sent by the batch loop.
+                // Preparation failures have no choice yet, so use index zero.
+                if let Err(error) = result {
+                    if send_stream_event(
+                        &reply,
+                        BatchGenerationEvent::Finished {
+                            index: 0,
+                            result: Err(error),
+                        },
+                    )
+                    .is_err()
+                    {
+                        return Err(permit);
+                    }
+                }
+                drop(permit);
+                Ok(())
+            }
             Self::Stream(reply) => {
                 let result = result.and_then(|result| match result {
                     JobResult::Generated(generation) => Ok(generation),
@@ -472,16 +571,81 @@ impl JobReply {
 }
 
 // Only full queues need to park the blocking inference worker.
-fn send_stream_event(
-    reply: &mpsc::Sender<GenerationEvent>,
-    event: GenerationEvent,
-) -> Result<(), InferenceError> {
+fn send_stream_event<T>(reply: &mpsc::Sender<T>, event: T) -> Result<(), InferenceError> {
     match reply.try_send(event) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(event)) => {
             reply.blocking_send(event).map_err(|_| cancelled_error())
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(cancelled_error()),
+    }
+}
+
+// The worker retains the permit across every choice, error cleanup, and failed
+// delivery. Dropping a batch receiver therefore has the same bounded successor
+// handoff semantics as dropping an ordinary stream.
+fn run_generation_batch(
+    engine: &mut impl Engine,
+    requests: Vec<GenerationRequest>,
+    reply: JobReply,
+    permit: OwnedSemaphorePermit,
+) {
+    let mut generations = Vec::new();
+    let mut generated = false;
+    for (index, request) in requests.into_iter().enumerate() {
+        if reply.is_closed() {
+            if generated {
+                engine.discard_request_state();
+            }
+            return;
+        }
+        let result = match engine.validate_generation(&request) {
+            Err(error) => Err(error),
+            Ok(()) => {
+                generated = true;
+                match &reply {
+                    JobReply::BatchStream(sender) => {
+                        engine.generate_stream(request, &|| sender.is_closed(), &mut |text| {
+                            send_stream_event(sender, BatchGenerationEvent::Delta { index, text })
+                        })
+                    }
+                    _ => engine.generate(request, &|| reply.is_closed()),
+                }
+            }
+        };
+        let failed = result.is_err();
+        if (failed || reply.is_closed()) && generated {
+            engine.discard_request_state();
+            generated = false;
+        }
+        match &reply {
+            JobReply::BatchStream(sender) => {
+                if send_stream_event(sender, BatchGenerationEvent::Finished { index, result })
+                    .is_err()
+                {
+                    if generated {
+                        engine.discard_request_state();
+                    }
+                    return;
+                }
+                if failed {
+                    return;
+                }
+            }
+            _ => match result {
+                Ok(generation) => generations.push(generation),
+                Err(error) => {
+                    let _ = reply.send(Err(error), permit);
+                    return;
+                }
+            },
+        }
+    }
+    if let Err(permit) = reply.send(Ok(JobResult::Batch(generations)), permit) {
+        if generated {
+            engine.discard_request_state();
+        }
+        drop(permit);
     }
 }
 
@@ -499,6 +663,7 @@ const CANCELLED_HANDOFF_TIMEOUT: Duration = Duration::from_millis(1500);
 enum Consumer {
     Single(Arc<AtomicBool>),
     Stream(mpsc::WeakSender<GenerationEvent>),
+    BatchStream(mpsc::WeakSender<BatchGenerationEvent>),
     Untracked,
 }
 
@@ -507,6 +672,7 @@ impl Consumer {
         match self {
             Self::Single(cancelled) => cancelled.load(Ordering::Acquire),
             Self::Stream(reply) => reply.upgrade().is_none_or(|reply| reply.is_closed()),
+            Self::BatchStream(reply) => reply.upgrade().is_none_or(|reply| reply.is_closed()),
             Self::Untracked => false,
         }
     }
@@ -566,6 +732,10 @@ impl InferenceService {
                     continue;
                 }
                 let (result, generated) = match request {
+                    PreparedRequest::Batch(requests) => {
+                        run_generation_batch(&mut engine, requests, job.reply, job._permit);
+                        continue;
+                    }
                     PreparedRequest::Generate(request) => {
                         if let Err(error) = engine.validate_generation(&request) {
                             let _ = job.reply.send(Err(error), job._permit);
@@ -575,6 +745,9 @@ impl InferenceService {
                             JobReply::Single(_) => {
                                 engine.generate(request, &|| job.reply.is_closed())
                             }
+                            JobReply::BatchStream(_) => Err(InferenceError::Internal(
+                                "single generation received a batch stream reply".into(),
+                            )),
                             JobReply::Stream(reply) => engine.generate_stream(
                                 request,
                                 &|| reply.is_closed(),
@@ -650,6 +823,35 @@ impl InferenceService {
     ) -> Result<Generation, InferenceError> {
         self.generate_job(JobRequest::Prepare(Box::new(prepare)))
             .await
+    }
+
+    /// Execute sequential native generations under one admission permit. This is
+    /// atomic with respect to other jobs, not GPU continuous batching.
+    pub async fn generate_batch_prepared(
+        &self,
+        prepare: impl FnOnce() -> Result<Vec<GenerationRequest>, InferenceError> + Send + 'static,
+    ) -> Result<Vec<Generation>, InferenceError> {
+        match self.submit(JobRequest::Batch(Box::new(prepare))).await? {
+            JobResult::Batch(generations) => Ok(generations),
+            _ => Err(InferenceError::Internal(
+                "unexpected result for batch job".into(),
+            )),
+        }
+    }
+
+    pub async fn stream_batch_prepared(
+        &self,
+        prepare: impl FnOnce() -> Result<Vec<GenerationRequest>, InferenceError> + Send + 'static,
+    ) -> Result<mpsc::Receiver<BatchGenerationEvent>, InferenceError> {
+        let (reply, receive) = mpsc::channel(STREAM_CAPACITY);
+        let consumer = Consumer::BatchStream(reply.downgrade());
+        self.enqueue_wait(
+            JobRequest::Batch(Box::new(prepare)),
+            JobReply::BatchStream(reply),
+            consumer,
+        )
+        .await?;
+        Ok(receive)
     }
 
     pub async fn stream_prepared(
@@ -787,6 +989,7 @@ impl InferenceService {
             .map_err(|_| InferenceError::Busy)?;
         *active = match &reply {
             JobReply::Stream(reply) => Consumer::Stream(reply.downgrade()),
+            JobReply::BatchStream(reply) => Consumer::BatchStream(reply.downgrade()),
             JobReply::Single(_) => Consumer::Untracked,
         };
         self.enqueue_admitted(request, reply, permit)
@@ -1271,9 +1474,15 @@ impl LlamaEngine {
 
 impl Engine for LlamaEngine {
     fn validate_generation(&self, request: &GenerationRequest) -> Result<(), InferenceError> {
+        let n_vocab = self.session.borrow_owner().model.n_vocab();
         if let Some(controls) = request.prompt.generation_controls() {
-            controls.validate_vocab(self.session.borrow_owner().model.n_vocab())?;
+            controls.validate_vocab(n_vocab)?;
         }
+        validated_prompt_tokens(
+            &request.prompt,
+            n_vocab,
+            TOKENIZER_MAX_TOKENS.min(self.config.context as usize),
+        )?;
         Ok(())
     }
 
@@ -1359,6 +1568,12 @@ impl Engine for LlamaEngine {
         // the dependent Session, its prefix cache, batch, or native KV memory.
         let loaded = self.session.borrow_owner();
         let model = &loaded.model;
+        if let Some(tokens) =
+            validated_prompt_tokens(&prompt, model.n_vocab(), TOKENIZER_MAX_TOKENS)?
+        {
+            ensure_active(cancelled)?;
+            return Ok(tokens.len());
+        }
         let (formatted, _) = format_prompt(
             model,
             &loaded.chat_formatter,
@@ -1649,6 +1864,15 @@ impl Session<'_> {
         let options = request.options;
         options.validate(config.context)?;
         ensure_active(cancelled)?;
+        let context_size = self.context.n_ctx().min(config.context);
+        // Validate and extract before formatting, prefix reset, or native decode.
+        // Wrappers still supply output controls, but never alter these input IDs.
+        let raw_tokens = validated_prompt_tokens(
+            &request.prompt,
+            model.n_vocab(),
+            TOKENIZER_MAX_TOKENS.min(context_size as usize),
+        )?
+        .map(|tokens| tokens.iter().copied().map(LlamaToken).collect::<Vec<_>>());
         let has_images = request.prompt.has_images();
         validate_image_support(
             has_images,
@@ -1677,23 +1901,50 @@ impl Session<'_> {
         controls.validate_vocab(model.n_vocab())?;
         let greedy_fast_path =
             use_controlled_greedy_fast_path(&options, grammar.is_some(), &controls);
-        let mut sampler = generation_sampler_with_controls(
-            grammar,
-            &options,
-            &controls,
-            model.n_vocab(),
-            config.context,
-        );
+        // The enabled path applies constraints once to the full vocabulary, then
+        // records pre-temperature/pre-top-p probabilities before selection.
+        let (mut diagnostic_sampler, mut sampler) = if controls.logprobs.is_some() {
+            (
+                Some(LlamaSampler::chain_simple(generation_preprocessors(
+                    grammar,
+                    &controls,
+                    model.n_vocab(),
+                    config.context,
+                ))),
+                LlamaSampler::chain_simple(generation_selection(&options)),
+            )
+        } else {
+            (
+                None,
+                generation_sampler_with_controls(
+                    grammar,
+                    &options,
+                    &controls,
+                    model.n_vocab(),
+                    config.context,
+                ),
+            )
+        };
+        let mut diagnostics = controls.logprobs.map(|_| LogprobCollector {
+            budget: controls.output_budget.clone(),
+            ..Default::default()
+        });
+        let output_budget = controls.output_budget.as_ref();
         let mut stops = StopFilter::new(controls.stop);
         ensure_active(cancelled)?;
-        let (prompt, images) = format_prompt(
-            model,
-            chat_formatter,
-            request.prompt,
-            has_images,
-            config.definition.as_ref(),
-        )?;
-        let context_size = self.context.n_ctx().min(config.context);
+        let (prompt, images) = if raw_tokens.is_some() {
+            // This placeholder is never tokenized: the exact native token vector
+            // below bypasses both definition/chat formatting and tokenization.
+            (String::new(), Vec::new())
+        } else {
+            format_prompt(
+                model,
+                chat_formatter,
+                request.prompt,
+                has_images,
+                config.definition.as_ref(),
+            )?
+        };
         let batch_size = self.context.n_batch().min(config.batch).min(context_size) as usize;
 
         let prompt_tokens;
@@ -1736,7 +1987,7 @@ impl Session<'_> {
                 ));
             }
         } else {
-            let tokens = tokenize_text_prompt(model, &prompt);
+            let tokens = raw_tokens.unwrap_or_else(|| tokenize_text_prompt(model, &prompt));
             prompt_tokens = tokens.len();
             output_limit = output_allowance(prompt_tokens, prompt_tokens, &options, context_size)?;
             self.prefill_text(tokens, batch_size, cancelled)?;
@@ -1750,10 +2001,44 @@ impl Session<'_> {
             prompt_tokens,
             completion_tokens: 0,
             finish_reason: "length",
+            logprobs: None,
+            mean_logprob: None,
         };
         for index in 0..output_limit {
             ensure_active(cancelled)?;
-            let token = if greedy_fast_path {
+            let mut distribution = None;
+            let token = if let Some(preprocessor) = diagnostic_sampler.as_mut() {
+                use llama_cpp_2::token::{data::LlamaTokenData, data_array::LlamaTokenDataArray};
+                let mut candidates = LlamaTokenDataArray::new(
+                    self.context
+                        .get_logits_ith(-1)
+                        .iter()
+                        .enumerate()
+                        .map(|(id, logit)| LlamaTokenData::new(LlamaToken(id as i32), *logit, 0.0))
+                        .collect(),
+                    false,
+                );
+                preprocessor.apply(&mut candidates);
+                // Candidate `p` is native sampler scratch (possibly not populated
+                // until top-p). Normalize filtered logits ourselves, before the
+                // selector can reorder/truncate/rescale this CPU buffer.
+                distribution = Some(LogprobDistribution::new(
+                    candidates
+                        .data
+                        .iter()
+                        .map(|candidate| (candidate.id(), candidate.logit())),
+                    controls.logprobs.unwrap_or(0),
+                )?);
+                sampler.apply(&mut candidates);
+                let token = candidates.selected_token().ok_or_else(|| {
+                    InferenceError::Internal("native sampler did not select a token".into())
+                })?;
+                // Only this chain owns grammar/penalty history. accept exactly
+                // once here; the selection-only chain has no such history.
+                preprocessor.accept(token);
+                sampler.accept(token);
+                token
+            } else if greedy_fast_path {
                 // The logits borrow ends at selection, before any context mutation.
                 let token = greedy_token(self.context.get_logits_ith(-1)).ok_or_else(|| {
                     InferenceError::Internal(
@@ -1767,16 +2052,34 @@ impl Session<'_> {
                 sampler.sample(&self.context, -1)
             };
             result.completion_tokens += 1;
-            if vocab.is_eog(token) {
+            let is_eog = vocab.is_eog(token);
+            let piece = if is_eog {
+                Vec::new()
+            } else {
+                vocab.token_to_piece(token, false, None)
+            };
+            if let (Some(collector), Some(distribution)) = (diagnostics.as_mut(), distribution) {
+                collector.record(token, is_eog, piece.clone(), distribution, |id| {
+                    // Special/EOG alternatives have no visible text and must not
+                    // expose native control-token spellings.
+                    if vocab.is_eog(id) {
+                        None
+                    } else {
+                        Some(vocab.token_to_piece(id, false, None))
+                    }
+                })?;
+            }
+            if is_eog {
                 result.finish_reason = "stop";
                 break;
             }
-            if append_generation_utf8(
+            if append_budgeted_generation_utf8(
                 &mut decoder,
-                &vocab.token_to_piece(token, false, None),
+                &piece,
                 &mut result.text,
                 false,
                 &mut stops,
+                output_budget,
                 emit,
             )? {
                 result.finish_reason = "stop";
@@ -1797,14 +2100,172 @@ impl Session<'_> {
                 position += 1;
             }
         }
-        if append_generation_utf8(&mut decoder, &[], &mut result.text, true, &mut stops, emit)? {
+        if append_budgeted_generation_utf8(
+            &mut decoder,
+            &[],
+            &mut result.text,
+            true,
+            &mut stops,
+            output_budget,
+            emit,
+        )? {
             result.finish_reason = "stop";
         }
         ensure_active(cancelled)?;
+        if let Some(collector) = diagnostics {
+            let (visible, mean) = collector.finish(&result.text);
+            result.logprobs = Some(visible);
+            result.mean_logprob = mean;
+        }
         if has_images {
             self.reset();
         }
         Ok(result)
+    }
+}
+
+/// Native scores after bias/penalties/grammar, before temperature and top-p.
+/// Subtract the maximum before both exponentiation and the final log subtraction:
+/// adding ln(sum) to an enormous maximum would lose the normalization entirely.
+struct LogprobDistribution {
+    scores: Vec<(LlamaToken, f64)>,
+    top: Vec<(LlamaToken, f64)>,
+}
+
+impl LogprobDistribution {
+    fn new(
+        logits: impl Iterator<Item = (LlamaToken, f32)> + Clone,
+        top_count: usize,
+    ) -> Result<Self, InferenceError> {
+        if top_count > 20 {
+            return Err(InferenceError::Invalid(
+                "at most 20 top logprobs are supported".into(),
+            ));
+        }
+        let mut max = f64::NEG_INFINITY;
+        for (_, logit) in logits.clone() {
+            if logit.is_nan() || logit == f32::INFINITY {
+                return Err(InferenceError::Internal(
+                    "native logprobs received NaN or positive infinity".into(),
+                ));
+            }
+            max = max.max(f64::from(logit));
+        }
+        if !max.is_finite() {
+            return Err(InferenceError::Internal(
+                "native logprobs have no finite candidate".into(),
+            ));
+        }
+        let sum: f64 = logits
+            .clone()
+            .map(|(_, score)| (f64::from(score) - max).exp())
+            .sum();
+        let log_sum = sum.ln();
+        let scores: Vec<_> = logits
+            .map(|(id, score)| (id, (f64::from(score) - max) - log_sum))
+            .collect();
+        // A bounded top-k avoids sorting or allocating another vocabulary-sized
+        // array. Some(0), including internal best_of scoring, allocates no top-k.
+        let mut top: Vec<(LlamaToken, f64)> = Vec::with_capacity(top_count);
+        if top_count > 0 {
+            for &(id, score) in &scores {
+                if !score.is_finite() {
+                    continue;
+                }
+                let index = top.partition_point(|(other_id, other_score)| {
+                    *other_score > score || (*other_score == score && other_id.0 < id.0)
+                });
+                if index < top_count {
+                    if top.len() == top_count {
+                        top.pop();
+                    }
+                    top.insert(index, (id, score));
+                }
+            }
+        }
+        Ok(Self { scores, top })
+    }
+
+    fn selected(&self, token: LlamaToken) -> Result<f64, InferenceError> {
+        self.scores
+            .iter()
+            .find(|(id, _)| *id == token)
+            .map(|(_, score)| *score)
+            .filter(|score| score.is_finite())
+            .ok_or_else(|| {
+                InferenceError::Internal(
+                    "native sampler selected a token without finite probability".into(),
+                )
+            })
+    }
+}
+
+#[derive(Default)]
+struct LogprobCollector {
+    records: Vec<TokenLogprob>,
+    budget: Option<OutputBudget>,
+    sum: f64,
+    count: usize,
+}
+
+impl LogprobCollector {
+    fn record(
+        &mut self,
+        token: LlamaToken,
+        is_eog: bool,
+        bytes: Vec<u8>,
+        distribution: LogprobDistribution,
+        mut piece: impl FnMut(LlamaToken) -> Option<Vec<u8>>,
+    ) -> Result<(), InferenceError> {
+        let logprob = distribution.selected(token)?;
+        self.sum += logprob;
+        self.count += 1;
+        if !is_eog {
+            let label = String::from_utf8_lossy(&bytes);
+            if let Some(budget) = &self.budget {
+                budget.charge(diagnostic_bytes(label.len(), bytes.len()))?;
+            }
+            let mut top_logprobs = Vec::new();
+            for (id, logprob) in distribution.top {
+                let Some(bytes) = piece(id) else {
+                    continue;
+                };
+                let label = String::from_utf8_lossy(&bytes);
+                if let Some(budget) = &self.budget {
+                    budget.charge(diagnostic_bytes(label.len(), bytes.len()))?;
+                }
+                top_logprobs.push(TokenAlternative {
+                    token: label.into_owned(),
+                    bytes,
+                    logprob,
+                });
+            }
+            self.records.push(TokenLogprob {
+                token: label.into_owned(),
+                bytes,
+                logprob,
+                top_logprobs,
+            });
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, visible: &str) -> (Vec<TokenLogprob>, Option<f64>) {
+        // Stop strings may begin inside a token or span several tokens. Publish
+        // only complete tokens whose raw bytes exactly align with visible text;
+        // never relabel a partial token's probability as a new token. Likewise,
+        // omit diagnostics after a lossy UTF-8 replacement rather than inventing
+        // alignment. Split UTF-8 tokens retain their original byte vectors.
+        let mut offset = 0usize;
+        let mut aligned = true;
+        self.records.retain(|record| {
+            let end = offset.saturating_add(record.bytes.len());
+            aligned &= visible.as_bytes().get(offset..end) == Some(record.bytes.as_slice());
+            offset = end;
+            aligned && !record.bytes.is_empty()
+        });
+        let mean = (self.count > 0).then(|| self.sum / self.count as f64);
+        (self.records, mean)
     }
 }
 
@@ -1878,7 +2339,32 @@ fn generation_sampler_with_controls(
     n_vocab: i32,
     history_limit: u32,
 ) -> LlamaSampler {
+    // Keep the disabled/default path's original single small allocation; the
+    // diagnostic split must not add buffers to ordinary greedy requests.
     let mut chain = Vec::with_capacity(if controls.has_sampling() { 6 } else { 4 });
+    append_generation_preprocessors(&mut chain, grammar, controls, n_vocab, history_limit);
+    append_generation_selection(&mut chain, options);
+    LlamaSampler::chain_simple(chain)
+}
+
+fn generation_preprocessors(
+    grammar: Option<LlamaSampler>,
+    controls: &GenerationControls,
+    n_vocab: i32,
+    history_limit: u32,
+) -> Vec<LlamaSampler> {
+    let mut chain = Vec::with_capacity(if controls.has_sampling() { 3 } else { 1 });
+    append_generation_preprocessors(&mut chain, grammar, controls, n_vocab, history_limit);
+    chain
+}
+
+fn append_generation_preprocessors(
+    chain: &mut Vec<LlamaSampler>,
+    grammar: Option<LlamaSampler>,
+    controls: &GenerationControls,
+    n_vocab: i32,
+    history_limit: u32,
+) {
     if controls.frequency_penalty != 0.0 || controls.presence_penalty != 0.0 {
         // No prompt tokens are accepted. Keep the entire generated history, not
         // a sliding repetition window; a request cannot exceed its context.
@@ -1901,6 +2387,15 @@ fn generation_sampler_with_controls(
     // Grammar must filter the full candidate set before any selection, including
     // greedy; appending it after selection does not enforce constrained output.
     chain.extend(grammar);
+}
+
+fn generation_selection(options: &Options) -> Vec<LlamaSampler> {
+    let mut chain = Vec::with_capacity(3);
+    append_generation_selection(&mut chain, options);
+    chain
+}
+
+fn append_generation_selection(chain: &mut Vec<LlamaSampler>, options: &Options) {
     if options.temperature == 0.0 {
         chain.push(LlamaSampler::greedy());
     } else {
@@ -1915,7 +2410,6 @@ fn generation_sampler_with_controls(
             LlamaSampler::dist(seed),
         ]);
     }
-    LlamaSampler::chain_simple(chain)
 }
 
 fn kv_cache_type(kind: &str, flash: &str) -> Result<KvCacheType, String> {
@@ -2074,6 +2568,11 @@ fn format_prompt(
     has_images: bool,
     definition: Option<&crate::models::modelfile::Definition>,
 ) -> Result<(String, Vec<Vec<u8>>), InferenceError> {
+    if prompt.token_ids().is_some() {
+        return Err(InferenceError::Invalid(
+            "raw token prompts must bypass text formatting".into(),
+        ));
+    }
     let prompt = super::chat::profile_prompt(prompt, definition);
     format_prompt_with(prompt, has_images, &mut |messages| {
         chat_formatter.format(model, messages)
@@ -2087,6 +2586,9 @@ fn format_prompt_with(
 ) -> Result<(String, Vec<Vec<u8>>), InferenceError> {
     match prompt {
         Prompt::Text(text) => Ok((text, Vec::new())),
+        Prompt::Tokens(_) => Err(InferenceError::Invalid(
+            "raw token prompts must bypass text formatting".into(),
+        )),
         Prompt::Constrained { prompt, .. }
         | Prompt::RequestSystem { prompt, .. }
         | Prompt::Controls { prompt, .. } => format_prompt_with(*prompt, has_images, render),
@@ -2114,6 +2616,28 @@ fn reject_count_images(prompt: &Prompt) -> Result<(), InferenceError> {
         ));
     }
     Ok(())
+}
+
+fn validated_prompt_tokens(
+    prompt: &Prompt,
+    n_vocab: i32,
+    limit: usize,
+) -> Result<Option<&[i32]>, InferenceError> {
+    let Some(tokens) = prompt.token_ids() else {
+        return Ok(None);
+    };
+    let limit = limit.min(TOKENIZER_MAX_TOKENS).min(i32::MAX as usize);
+    if tokens.is_empty() || tokens.len() > limit {
+        return Err(InferenceError::Invalid(format!(
+            "token prompt must contain between 1 and {limit} native token IDs"
+        )));
+    }
+    if let Some(id) = tokens.iter().find(|id| **id < 0 || **id >= n_vocab) {
+        return Err(InferenceError::Invalid(format!(
+            "prompt token ID {id} is outside the loaded vocabulary ({n_vocab} tokens)"
+        )));
+    }
+    Ok(Some(tokens))
 }
 
 fn tokenize_text_prompt(model: &LlamaModel, prompt: &str) -> Vec<LlamaToken> {
@@ -2157,6 +2681,56 @@ fn check_budget(prompt: usize, generated: u32, context: u32) -> Result<(), Infer
         )));
     }
     Ok(())
+}
+
+// The unbudgeted path keeps its original decoder/append path and allocations.
+// Budgeted requests decode through a fixed stack buffer, then charge visible
+// bytes before extending retained text or emitting a delta. Stop/UTF-8 flushes use the
+// same path; suppressed diagnostic records remain charged conservatively.
+fn append_budgeted_generation_utf8(
+    decoder: &mut Decoder,
+    bytes: &[u8],
+    text: &mut String,
+    last: bool,
+    stops: &mut Option<StopFilter>,
+    budget: Option<&OutputBudget>,
+    emit: &mut dyn FnMut(&str) -> Result<(), InferenceError>,
+) -> Result<bool, InferenceError> {
+    let Some(budget) = budget else {
+        return append_generation_utf8(decoder, bytes, text, last, stops, emit);
+    };
+    let mut buffer = [0u8; 4096];
+    let mut input = bytes;
+    let mut append = |delta: &str| {
+        budget.charge(delta.len())?;
+        text.push_str(delta);
+        emit(delta)
+    };
+    loop {
+        let (result, read, written, _) = decoder.decode_to_utf8(input, &mut buffer, last);
+        let decoded = std::str::from_utf8(&buffer[..written])
+            .map_err(|_| InferenceError::Internal("UTF-8 decoder returned invalid text".into()))?;
+        if let Some(stops) = stops {
+            if stops.push(
+                decoded,
+                last && result == CoderResult::InputEmpty,
+                &mut append,
+            )? {
+                return Ok(true);
+            }
+        } else if !decoded.is_empty() {
+            append(decoded)?;
+        }
+        input = &input[read..];
+        if result == CoderResult::InputEmpty {
+            return Ok(false);
+        }
+        if read == 0 && written == 0 {
+            return Err(InferenceError::Internal(
+                "UTF-8 decoder could not make progress".into(),
+            ));
+        }
+    }
 }
 
 fn append_generation_utf8(
@@ -2222,6 +2796,1149 @@ mod native_tests;
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn distribution(logits: &[f32], top: usize) -> Result<LogprobDistribution, InferenceError> {
+        LogprobDistribution::new(
+            logits
+                .iter()
+                .enumerate()
+                .map(|(id, score)| (LlamaToken(id as i32), *score)),
+            top,
+        )
+    }
+
+    fn wrapped_token_prompt(tokens: Vec<i32>) -> Prompt {
+        Prompt::Constrained {
+            prompt: Box::new(Prompt::Tokens(tokens)),
+            schema: serde_json::json!({"type": "object"}),
+        }
+        .with_controls(GenerationControls {
+            logprobs: Some(0),
+            ..Default::default()
+        })
+        .with_request_system(false)
+    }
+
+    #[test]
+    fn native_token_prompt_policy_preserves_exact_ids_counts_and_wrappers() {
+        // Repeated IDs, an explicit zero, and a special-looking ID are input,
+        // not instructions to normalize, strip tokens, or prepend another BOS.
+        let ids = vec![0, 7, 7, 1, 3];
+        for prompt in [
+            Prompt::Tokens(ids.clone()),
+            wrapped_token_prompt(ids.clone()),
+        ] {
+            assert_eq!(prompt.token_ids(), Some(ids.as_slice()));
+            assert!(!prompt.has_images());
+            assert!(reject_count_images(&prompt).is_ok());
+            let validated = validated_prompt_tokens(&prompt, 8, 8).unwrap().unwrap();
+            assert_eq!(validated.len(), ids.len());
+            assert_eq!(fixture_token_count(&prompt), ids.len());
+            let native: Vec<LlamaToken> = validated.iter().copied().map(LlamaToken).collect();
+            assert_eq!(native.iter().map(|token| token.0).collect::<Vec<_>>(), ids);
+            assert!(
+                format_prompt_with(prompt, false, &mut |_| panic!(
+                    "token prompt rendered as chat"
+                ))
+                .is_err()
+            );
+        }
+        let wrapped = wrapped_token_prompt(ids);
+        assert_eq!(wrapped.generation_controls().unwrap().logprobs, Some(0));
+        assert_eq!(
+            wrapped.output_schema(),
+            Some(&serde_json::json!({"type": "object"}))
+        );
+        assert!(
+            validated_prompt_tokens(&Prompt::Text("text".into()), 8, 8)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_token_prompt_policy_rejects_empty_oversized_and_invalid_vocab_ids() {
+        for ids in [vec![], vec![-1], vec![8], vec![i32::MAX], vec![0; 9]] {
+            for prompt in [
+                Prompt::Tokens(ids.clone()),
+                wrapped_token_prompt(ids.clone()),
+            ] {
+                assert!(matches!(
+                    validated_prompt_tokens(&prompt, 8, 8),
+                    Err(InferenceError::Invalid(_))
+                ));
+            }
+        }
+        assert!(
+            validated_prompt_tokens(
+                &Prompt::Tokens(vec![0; TOKENIZER_MAX_TOKENS]),
+                1,
+                usize::MAX
+            )
+            .is_ok()
+        );
+        assert!(
+            validated_prompt_tokens(
+                &Prompt::Tokens(vec![0; TOKENIZER_MAX_TOKENS + 1]),
+                1,
+                usize::MAX
+            )
+            .is_err()
+        );
+        assert!(validated_prompt_tokens(&Prompt::Tokens(vec![0]), 0, 8).is_err());
+        assert!(validated_prompt_tokens(&Prompt::Tokens(vec![0]), 8, 0).is_err());
+        let prompt = wrapped_token_prompt(vec![0; 8]);
+        let count = validated_prompt_tokens(&prompt, 1, 8)
+            .unwrap()
+            .unwrap()
+            .len();
+        let options = generation_request().options;
+        assert!(output_allowance(count, count, &options, 8).is_err());
+        assert_eq!(output_allowance(count, count, &options, 9).unwrap(), 1);
+        // Count is exact even when generation's smaller context rejects input.
+        assert_eq!(
+            validated_prompt_tokens(&prompt, 1, TOKENIZER_MAX_TOKENS)
+                .unwrap()
+                .unwrap()
+                .len(),
+            8
+        );
+        assert!(validated_prompt_tokens(&prompt, 1, 7).is_err());
+    }
+
+    #[test]
+    fn logprobs_native_cpu_candidates_use_filtered_logits_not_scratch_probabilities() {
+        use llama_cpp_2::token::{data::LlamaTokenData, data_array::LlamaTokenDataArray};
+        let controls = GenerationControls {
+            frequency_penalty: 0.5,
+            presence_penalty: 0.25,
+            logit_bias: vec![(1, 0.75)],
+            ..Default::default()
+        };
+        let mask =
+            LlamaSampler::logit_bias(3, &[LlamaLogitBias::new(LlamaToken(0), f32::NEG_INFINITY)]);
+        let mut preprocess =
+            LlamaSampler::chain_simple(generation_preprocessors(Some(mask), &controls, 3, 128));
+        preprocess.accept_many([LlamaToken(1), LlamaToken(1), LlamaToken(2)]);
+        for _ in 0..2 {
+            let mut buffer = LlamaTokenDataArray::new(
+                [100.0, 2.0, 1.0]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, logit)| LlamaTokenData::new(LlamaToken(id as i32), logit, f32::NAN))
+                    .collect(),
+                false,
+            );
+            preprocess.apply(&mut buffer);
+            assert_eq!(
+                buffer
+                    .data
+                    .iter()
+                    .map(|candidate| candidate.logit())
+                    .collect::<Vec<_>>(),
+                [f32::NEG_INFINITY, 1.5, 0.25]
+            );
+            let probabilities = LogprobDistribution::new(
+                buffer
+                    .data
+                    .iter()
+                    .map(|candidate| (candidate.id(), candidate.logit())),
+                2,
+            )
+            .unwrap();
+            let expected = 1.0 / (1.0 + (-1.25_f64).exp());
+            assert!(
+                (probabilities.selected(LlamaToken(1)).unwrap().exp() - expected).abs() < 1e-12
+            );
+            assert_eq!(probabilities.top[0].0, LlamaToken(1));
+            assert!(probabilities.selected(LlamaToken(0)).is_err());
+            // Applying/scoring twice does not accept tokens or advance history.
+        }
+    }
+
+    #[test]
+    fn logprobs_normalize_stably_rank_ties_and_bound_topk() {
+        let logits = [0.0, 2.0_f32.ln(), 3.0_f32.ln(), f32::NEG_INFINITY];
+        let scored = distribution(&logits, 20).unwrap();
+        let sum: f64 = scored.scores.iter().map(|(_, score)| score.exp()).sum();
+        assert!((sum - 1.0).abs() < 1e-12);
+        for (id, expected) in [1.0_f64 / 6.0, 2.0 / 6.0, 3.0 / 6.0]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                (scored.selected(LlamaToken(id as i32)).unwrap().exp() - expected).abs() < 1e-7
+            );
+        }
+        assert_eq!(
+            scored.top.iter().map(|(id, _)| id.0).collect::<Vec<_>>(),
+            [2, 1, 0]
+        );
+        assert!(scored.selected(LlamaToken(3)).is_err());
+        assert!(scored.selected(LlamaToken(99)).is_err());
+        let tied = distribution(&[f32::MAX, f32::MAX, -f32::MAX], 1).unwrap();
+        assert_eq!(tied.top[0].0, LlamaToken(0));
+        assert_eq!(tied.selected(LlamaToken(0)).unwrap(), -2.0_f64.ln());
+        assert_eq!(tied.selected(LlamaToken(1)).unwrap(), -2.0_f64.ln());
+        assert!(tied.selected(LlamaToken(2)).unwrap().is_finite());
+        for offset in [-10_000.0, 10_000.0] {
+            let shifted = distribution(&[offset, offset + 1.0, offset - 2.0], 2).unwrap();
+            let base = distribution(&[0.0, 1.0, -2.0], 2).unwrap();
+            assert_eq!(shifted.scores, base.scores);
+        }
+        let many: Vec<f32> = (0..100).map(|id| id as f32).collect();
+        let top = distribution(&many, 20).unwrap();
+        assert_eq!(top.top.len(), 20);
+        assert_eq!(top.top[0].0, LlamaToken(99));
+        assert_eq!(top.top[19].0, LlamaToken(80));
+        let selected_only = distribution(&many, 0).unwrap();
+        assert_eq!(selected_only.top.capacity(), 0);
+        assert!(distribution(&many, 21).is_err());
+    }
+
+    #[test]
+    fn logprobs_reject_nan_positive_infinity_empty_and_all_masked_logits() {
+        for scores in [
+            vec![],
+            vec![f32::NEG_INFINITY],
+            vec![f32::NAN, 0.0],
+            vec![0.0, f32::INFINITY],
+        ] {
+            assert!(distribution(&scores, 0).is_err());
+        }
+        assert_eq!(
+            distribution(&[f32::NEG_INFINITY, -f32::MAX], 0)
+                .unwrap()
+                .selected(LlamaToken(1))
+                .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn logprobs_preselection_honors_native_controls_without_changing_selection() {
+        for temperature in [0.0, 0.8] {
+            let mut options = generation_request().options;
+            options.temperature = temperature;
+            options.top_p = 0.7;
+            options.seed = Some(42);
+            let controls = GenerationControls {
+                frequency_penalty: 0.5,
+                presence_penalty: 0.25,
+                logit_bias: vec![(1, 0.75)],
+                logprobs: Some(2),
+                ..Default::default()
+            };
+            let mask = || {
+                Some(LlamaSampler::logit_bias(
+                    3,
+                    &[LlamaLogitBias::new(LlamaToken(0), f32::NEG_INFINITY)],
+                ))
+            };
+            let mut combined =
+                generation_sampler_with_controls(mask(), &options, &controls, 3, 128);
+            let mut preprocess =
+                LlamaSampler::chain_simple(generation_preprocessors(mask(), &controls, 3, 128));
+            let mut select = LlamaSampler::chain_simple(generation_selection(&options));
+            let mut accepted = [0usize; 3];
+            for _ in 0..6 {
+                let mut baseline = candidates(&[100.0, 2.0, 1.0]);
+                let mut enabled = candidates(&[100.0, 2.0, 1.0]);
+                combined.apply(&mut baseline);
+                preprocess.apply(&mut enabled);
+                let scores =
+                    LogprobDistribution::new(enabled.data.iter().map(|c| (c.id(), c.logit())), 2)
+                        .unwrap();
+                assert_eq!(scores.top.len(), 2);
+                assert!(!scores.top.iter().any(|(id, _)| *id == LlamaToken(0)));
+                let total: f64 = scores.scores.iter().map(|(_, p)| p.exp()).sum();
+                assert!((total - 1.0).abs() < 1e-12);
+                let expected = |id: usize, base: f64| {
+                    base - 0.5 * accepted[id] as f64 - if accepted[id] > 0 { 0.25 } else { 0.0 }
+                };
+                let odds = expected(1, 2.75) - expected(2, 1.0);
+                let expected_probability = 1.0 / (1.0 + (-odds).exp());
+                assert!(
+                    (scores.selected(LlamaToken(1)).unwrap().exp() - expected_probability).abs()
+                        < 1e-12
+                );
+                select.apply(&mut enabled);
+                let token = enabled.selected_token().unwrap();
+                assert_eq!(Some(token), baseline.selected_token());
+                assert!(scores.selected(token).unwrap().is_finite());
+                combined.accept(token);
+                preprocess.accept(token);
+                select.accept(token);
+                accepted[token.0 as usize] += 1;
+            }
+        }
+    }
+
+    fn score_piece(collector: &mut LogprobCollector, bytes: &[u8], eog: bool) {
+        collector
+            .record(
+                LlamaToken(0),
+                eog,
+                bytes.to_vec(),
+                distribution(&[0.0, 0.0], 2).unwrap(),
+                |id| (id == LlamaToken(0)).then(|| bytes.to_vec()),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn logprobs_preserve_raw_bytes_but_never_expose_eog_or_suppressed_tokens() {
+        let mut collector = LogprobCollector::default();
+        score_piece(&mut collector, &[0xf0, 0x9f], false);
+        score_piece(&mut collector, &[0xa6, 0x80], false);
+        score_piece(&mut collector, b"EOG hidden", true);
+        let (records, mean) = collector.finish("🦀");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].bytes, [0xf0, 0x9f]);
+        assert_eq!(records[1].bytes, [0xa6, 0x80]);
+        assert_eq!(records[0].token, String::from_utf8_lossy(&[0xf0, 0x9f]));
+        assert_eq!(records[0].top_logprobs.len(), 1);
+        assert_eq!(records[0].top_logprobs[0].bytes, records[0].bytes);
+        assert!((mean.unwrap() + 2.0_f64.ln()).abs() < 1e-12);
+        let mut collector = LogprobCollector::default();
+        for piece in [b"hello ".as_slice(), b"EN", b"Dsecret"] {
+            score_piece(&mut collector, piece, false);
+        }
+        assert_eq!(collector.count, 3);
+        let (records, mean) = collector.finish("hello ");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].token, "hello ");
+        assert!(mean.is_some());
+        let mut collector = LogprobCollector::default();
+        score_piece(&mut collector, b"okENDsecret", false);
+        assert!(collector.finish("ok").0.is_empty());
+        let mut collector = LogprobCollector::default();
+        score_piece(&mut collector, &[0xff], false);
+        assert!(collector.finish("�").0.is_empty());
+        assert!(LogprobCollector::default().finish("").1.is_none());
+        let mut collector = LogprobCollector::default();
+        score_piece(&mut collector, b"ok", false);
+        collector
+            .record(
+                LlamaToken(0),
+                true,
+                Vec::new(),
+                distribution(&[0.0, 1.0], 0).unwrap(),
+                |_| None,
+            )
+            .unwrap();
+        let (records, mean) = collector.finish("ok");
+        assert_eq!(records.len(), 1);
+        let expected = (-2.0_f64.ln() - 1.0_f64.exp().ln_1p()) / 2.0;
+        assert!((mean.unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn output_budget_preserves_wrapped_prompt_controls_and_sampling() {
+        let budget = OutputBudget::new(3);
+        let prompt = wrapped_token_prompt(vec![0, 7, 7]).with_output_budget(budget.clone());
+        assert_eq!(prompt.token_ids(), Some([0, 7, 7].as_slice()));
+        assert!(prompt.output_schema().is_some());
+        assert_eq!(prompt.generation_controls().unwrap().logprobs, Some(0));
+        prompt
+            .generation_controls()
+            .unwrap()
+            .output_budget
+            .as_ref()
+            .unwrap()
+            .charge(3)
+            .unwrap();
+        assert!(budget.charge(1).is_err());
+        let prompt = Prompt::Text("x".into()).with_output_budget(OutputBudget::new(1));
+        let controls = prompt.generation_controls().unwrap();
+        assert!(controls.logprobs.is_none());
+        assert!(use_controlled_greedy_fast_path(
+            &generation_request().options,
+            false,
+            controls
+        ));
+    }
+
+    #[test]
+    fn output_budget_diagnostics_fail_before_retaining_an_over_budget_record() {
+        let cost = diagnostic_bytes(1, 1);
+        let budget = OutputBudget::new(2 * cost);
+        let mut collector = LogprobCollector {
+            budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        collector
+            .record(
+                LlamaToken(0),
+                false,
+                b"x".to_vec(),
+                distribution(&[0.0, 0.0], 1).unwrap(),
+                |_| Some(b"y".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(collector.records.len(), 1);
+        assert_eq!(collector.records[0].top_logprobs.len(), 1);
+        // EOG affects ranking but allocates/charges no visible diagnostic record.
+        collector
+            .record(
+                LlamaToken(0),
+                true,
+                vec![],
+                distribution(&[0.0], 0).unwrap(),
+                |_| panic!("EOG alternative"),
+            )
+            .unwrap();
+        assert!(matches!(
+            collector.record(
+                LlamaToken(0),
+                false,
+                b"x".to_vec(),
+                distribution(&[0.0], 0).unwrap(),
+                |_| None
+            ),
+            Err(InferenceError::ResourceLimit(_))
+        ));
+        assert_eq!(collector.records.len(), 1);
+        let mut collector = LogprobCollector {
+            budget: Some(OutputBudget::new(cost)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            collector.record(
+                LlamaToken(0),
+                false,
+                b"x".to_vec(),
+                distribution(&[0.0, 0.0], 1).unwrap(),
+                |_| Some(b"y".to_vec())
+            ),
+            Err(InferenceError::ResourceLimit(_))
+        ));
+        assert!(
+            collector.records.is_empty(),
+            "an alternative exhausted the same budget"
+        );
+    }
+
+    #[test]
+    fn output_budget_native_charges_match_response_accounting_at_exact_limit() {
+        let limit = 1 + 2 * diagnostic_bytes(1, 1);
+        let budget = OutputBudget::new(limit);
+        let mut collector = LogprobCollector {
+            budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        collector
+            .record(
+                LlamaToken(0),
+                false,
+                b"x".to_vec(),
+                distribution(&[0.0, 0.0], 1).unwrap(),
+                |_| Some(b"y".to_vec()),
+            )
+            .unwrap();
+        let mut text = String::new();
+        append_budgeted_generation_utf8(
+            &mut UTF_8.new_decoder_without_bom_handling(),
+            b"x",
+            &mut text,
+            true,
+            &mut None,
+            Some(&budget),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let (records, mean) = collector.finish(&text);
+        let result = Generation {
+            text,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "length",
+            logprobs: Some(records),
+            mean_logprob: mean,
+        };
+        assert_eq!(super::super::openai::output_bytes(&result), limit);
+        assert!(matches!(
+            budget.charge(1),
+            Err(InferenceError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn output_budget_text_covers_split_utf8_flush_stops_and_large_pieces() {
+        for (pieces, stops, limit, expected, fails) in [
+            (vec![vec![0xc3], vec![0xa9]], vec![], 2, "é", false),
+            (vec![vec![0xc3], vec![0xa9]], vec![], 1, "", true),
+            (vec![vec![0xff]], vec![], 2, "", true),
+            (vec![vec![0xc3]], vec![], 2, "", true),
+            (
+                vec![b"okENDhidden".to_vec()],
+                vec!["END".into()],
+                2,
+                "ok",
+                false,
+            ),
+            (vec![b"EN".to_vec()], vec!["END".into()], 1, "", true),
+        ] {
+            let budget = OutputBudget::new(limit);
+            let mut decoder = UTF_8.new_decoder_without_bom_handling();
+            let mut text = String::new();
+            let mut emitted = String::new();
+            let mut stops = StopFilter::new(stops);
+            let result = (|| {
+                for piece in pieces {
+                    if append_budgeted_generation_utf8(
+                        &mut decoder,
+                        &piece,
+                        &mut text,
+                        false,
+                        &mut stops,
+                        Some(&budget),
+                        &mut |delta| {
+                            emitted.push_str(delta);
+                            Ok(())
+                        },
+                    )? {
+                        break;
+                    }
+                }
+                append_budgeted_generation_utf8(
+                    &mut decoder,
+                    &[],
+                    &mut text,
+                    true,
+                    &mut stops,
+                    Some(&budget),
+                    &mut |delta| {
+                        emitted.push_str(delta);
+                        Ok(())
+                    },
+                )
+            })();
+            assert_eq!(text, expected);
+            assert_eq!(emitted, expected);
+            assert_eq!(result.is_err(), fails);
+            if fails {
+                assert!(matches!(result, Err(InferenceError::ResourceLimit(_))));
+            }
+        }
+        let mut decoder = UTF_8.new_decoder_without_bom_handling();
+        let mut text = String::new();
+        let piece = "é".repeat(4097);
+        append_budgeted_generation_utf8(
+            &mut decoder,
+            piece.as_bytes(),
+            &mut text,
+            true,
+            &mut None,
+            Some(&OutputBudget::new(piece.len())),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(text, piece);
+    }
+
+    struct OutputBudgetFixture {
+        calls: Arc<AtomicUsize>,
+        discards: Arc<AtomicUsize>,
+    }
+
+    impl Engine for OutputBudgetFixture {
+        fn generate(
+            &mut self,
+            request: GenerationRequest,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            self.generate_stream(request, cancelled, &mut |_| Ok(()))
+        }
+
+        fn generate_stream(
+            &mut self,
+            request: GenerationRequest,
+            cancelled: &dyn Fn() -> bool,
+            emit: &mut dyn FnMut(String) -> Result<(), InferenceError>,
+        ) -> Result<Generation, InferenceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let controls = request
+                .prompt
+                .generation_controls()
+                .cloned()
+                .unwrap_or_default();
+            let mut collector = controls.logprobs.map(|_| LogprobCollector {
+                budget: controls.output_budget.clone(),
+                ..Default::default()
+            });
+            let mut decoder = UTF_8.new_decoder_without_bom_handling();
+            let mut text = String::new();
+            for _ in 0..2 {
+                ensure_active(cancelled)?;
+                if let Some(collector) = &mut collector {
+                    collector.record(
+                        LlamaToken(0),
+                        false,
+                        b"x".to_vec(),
+                        distribution(&[0.0, 0.0], controls.logprobs.unwrap()).unwrap(),
+                        |_| Some(b"y".to_vec()),
+                    )?;
+                }
+                append_budgeted_generation_utf8(
+                    &mut decoder,
+                    b"x",
+                    &mut text,
+                    false,
+                    &mut None,
+                    controls.output_budget.as_ref(),
+                    &mut |delta| emit(delta.to_owned()),
+                )?;
+            }
+            let (logprobs, mean_logprob) = match collector {
+                Some(collector) => {
+                    let (records, mean) = collector.finish(&text);
+                    (Some(records), mean)
+                }
+                None => (None, None),
+            };
+            Ok(Generation {
+                text,
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                finish_reason: "length",
+                logprobs,
+                mean_logprob,
+            })
+        }
+
+        fn discard_request_state(&mut self) {
+            self.discards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn output_budget_worker_failure_stops_batch_and_releases_after_cleanup() {
+        for streaming in [false, true] {
+            for diagnostics in [None, Some(1)] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let discards = Arc::new(AtomicUsize::new(0));
+                let fixture = OutputBudgetFixture {
+                    calls: calls.clone(),
+                    discards: discards.clone(),
+                };
+                let (service, worker) = InferenceService::spawn(move || Ok(fixture)).await.unwrap();
+                let per_token = diagnostics.map_or(1, |_| 2 * diagnostic_bytes(1, 1) + 1);
+                let budget = OutputBudget::new(3 * per_token);
+                let prepare = move || {
+                    Ok((0..4)
+                        .map(|_| {
+                            let mut request = generation_request();
+                            request.prompt = request
+                                .prompt
+                                .with_controls(GenerationControls {
+                                    logprobs: diagnostics,
+                                    ..Default::default()
+                                })
+                                .with_output_budget(budget.clone());
+                            request
+                        })
+                        .collect())
+                };
+                if streaming {
+                    let mut receive = service.stream_batch_prepared(prepare).await.unwrap();
+                    let mut successes = 0;
+                    let mut failed = false;
+                    while let Some(event) = receive.recv().await {
+                        match event {
+                            BatchGenerationEvent::Finished {
+                                index: 0,
+                                result: Ok(_),
+                            } => successes += 1,
+                            BatchGenerationEvent::Finished {
+                                index: 1,
+                                result: Err(InferenceError::ResourceLimit(_)),
+                            } => failed = true,
+                            BatchGenerationEvent::Delta { index, .. } => assert!(index < 2),
+                            _ => panic!("unexpected budget batch event"),
+                        }
+                    }
+                    assert_eq!(successes, 1);
+                    assert!(failed);
+                } else {
+                    assert!(matches!(
+                        service.generate_batch_prepared(prepare).await,
+                        Err(InferenceError::ResourceLimit(_))
+                    ));
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert_eq!(discards.load(Ordering::SeqCst), 1);
+                // Admission is usable only after the worker's error cleanup.
+                assert_eq!(
+                    service.generate(generation_request()).await.unwrap().text,
+                    "xx"
+                );
+                drop(service);
+                worker.await.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn logprobs_default_has_no_diagnostic_buffers_or_sampling_flags() {
+        let controls = GenerationControls::default();
+        assert!(controls.logprobs.is_none());
+        assert!(controls.is_default());
+        assert_eq!(LogprobCollector::default().records.capacity(), 0);
+        assert!(use_controlled_greedy_fast_path(
+            &generation_request().options,
+            false,
+            &controls
+        ));
+        let scored = GenerationControls {
+            logprobs: Some(0),
+            ..Default::default()
+        };
+        assert!(!scored.has_sampling());
+        assert!(!scored.is_default());
+        assert!(matches!(
+            Prompt::Text("hello".into()).with_controls(scored),
+            Prompt::Controls { .. }
+        ));
+    }
+
+    struct BatchFixture {
+        calls: Arc<AtomicUsize>,
+        discards: Arc<AtomicUsize>,
+        fail_at: Option<usize>,
+        gate_at: Option<usize>,
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Engine for BatchFixture {
+        fn generate(
+            &mut self,
+            request: GenerationRequest,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            self.generate_stream(request, cancelled, &mut |_| Ok(()))
+        }
+
+        fn generate_stream(
+            &mut self,
+            request: GenerationRequest,
+            cancelled: &dyn Fn() -> bool,
+            emit: &mut dyn FnMut(String) -> Result<(), InferenceError>,
+        ) -> Result<Generation, InferenceError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.gate_at == Some(call) {
+                self.entered.take().unwrap().send(()).unwrap();
+                self.release
+                    .as_ref()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            ensure_active(cancelled)?;
+            let Prompt::Text(text) = request.prompt else {
+                panic!("expected text fixture prompt")
+            };
+            emit(text.clone())?;
+            if self.fail_at == Some(call) {
+                return Err(InferenceError::Internal("batch fixture failed".into()));
+            }
+            Ok(Generation {
+                text,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
+            })
+        }
+
+        fn discard_request_state(&mut self) {
+            self.discards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn batch_requests(count: usize) -> Vec<GenerationRequest> {
+        (0..count)
+            .map(|index| GenerationRequest {
+                prompt: Prompt::Text(format!("choice {index}")),
+                ..generation_request()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn batch_single_and_stream_are_ordered_atomic_worker_jobs() {
+        for streaming in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let discards = Arc::new(AtomicUsize::new(0));
+            let (entered, ready) = oneshot::channel();
+            let (release, gate) = std::sync::mpsc::channel();
+            let fixture = BatchFixture {
+                calls: calls.clone(),
+                discards: discards.clone(),
+                fail_at: None,
+                gate_at: Some(1),
+                entered: Some(entered),
+                release: Some(gate),
+            };
+            let (service, worker) = InferenceService::spawn(move || Ok(fixture)).await.unwrap();
+            let prepared_on_worker = Arc::new(AtomicBool::new(false));
+            let caller = std::thread::current().id();
+            let prepare = {
+                let prepared = prepared_on_worker.clone();
+                move || {
+                    assert_ne!(std::thread::current().id(), caller);
+                    prepared.store(true, Ordering::SeqCst);
+                    Ok(batch_requests(3))
+                }
+            };
+            let mut stream = None;
+            let mut single = None;
+            if streaming {
+                stream = Some(service.stream_batch_prepared(prepare).await.unwrap());
+            } else {
+                single = Some(tokio::spawn({
+                    let service = service.clone();
+                    async move { service.generate_batch_prepared(prepare).await }
+                }));
+            }
+            tokio::time::timeout(Duration::from_secs(2), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(prepared_on_worker.load(Ordering::SeqCst));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(service.admission.available_permits(), 0);
+            assert!(matches!(
+                service
+                    .generate_prepared(|| panic!("ordinary interleaving"))
+                    .await,
+                Err(InferenceError::Busy)
+            ));
+            assert!(matches!(
+                service
+                    .generate_batch_prepared(|| panic!("batch interleaving"))
+                    .await,
+                Err(InferenceError::Busy)
+            ));
+            release.send(()).unwrap();
+            if let Some(mut stream) = stream {
+                for expected in 0..3 {
+                    assert!(
+                        matches!(stream.recv().await, Some(BatchGenerationEvent::Delta { index, text }) if index == expected && text == format!("choice {expected}"))
+                    );
+                    assert!(
+                        matches!(stream.recv().await, Some(BatchGenerationEvent::Finished { index, result: Ok(result) }) if index == expected && result.text == format!("choice {expected}"))
+                    );
+                }
+                assert!(stream.recv().await.is_none());
+            }
+            if let Some(single) = single {
+                let results = single.await.unwrap().unwrap();
+                assert_eq!(
+                    results.iter().map(|g| g.text.as_str()).collect::<Vec<_>>(),
+                    ["choice 0", "choice 1", "choice 2"]
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(discards.load(Ordering::SeqCst), 0);
+            drop(service);
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_limits_and_preparation_errors_never_touch_engine() {
+        let (service, worker, calls, discards) = counting_service().await;
+        for size in [0, 129] {
+            assert!(matches!(
+                service
+                    .generate_batch_prepared(move || Ok(batch_requests(size)))
+                    .await,
+                Err(InferenceError::Invalid(_))
+            ));
+            let mut stream = service
+                .stream_batch_prepared(move || Ok(batch_requests(size)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                stream.recv().await,
+                Some(BatchGenerationEvent::Finished {
+                    index: 0,
+                    result: Err(InferenceError::Invalid(_))
+                })
+            ));
+            assert!(stream.recv().await.is_none());
+        }
+        let mut stream = service
+            .stream_batch_prepared(|| Err(InferenceError::Invalid("bad prepare".into())))
+            .await
+            .unwrap();
+        assert!(
+            matches!(stream.recv().await, Some(BatchGenerationEvent::Finished { index: 0, result: Err(InferenceError::Invalid(message)) }) if message == "bad prepare")
+        );
+        assert!(stream.recv().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(discards.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service
+                .generate_batch_prepared(|| Ok(batch_requests(128)))
+                .await
+                .unwrap()
+                .len(),
+            128
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 128);
+        drop(service);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_first_generation_error_is_terminal_and_discards_before_release() {
+        for streaming in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let discards = Arc::new(AtomicUsize::new(0));
+            let fixture = BatchFixture {
+                calls: calls.clone(),
+                discards: discards.clone(),
+                fail_at: Some(1),
+                gate_at: None,
+                entered: None,
+                release: None,
+            };
+            let (service, worker) = InferenceService::spawn(move || Ok(fixture)).await.unwrap();
+            if streaming {
+                let mut stream = service
+                    .stream_batch_prepared(|| Ok(batch_requests(3)))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    stream.recv().await,
+                    Some(BatchGenerationEvent::Delta { index: 0, .. })
+                ));
+                assert!(matches!(
+                    stream.recv().await,
+                    Some(BatchGenerationEvent::Finished {
+                        index: 0,
+                        result: Ok(_)
+                    })
+                ));
+                assert!(matches!(
+                    stream.recv().await,
+                    Some(BatchGenerationEvent::Delta { index: 1, .. })
+                ));
+                assert!(matches!(
+                    stream.recv().await,
+                    Some(BatchGenerationEvent::Finished {
+                        index: 1,
+                        result: Err(InferenceError::Internal(_))
+                    })
+                ));
+                assert!(stream.recv().await.is_none());
+            } else {
+                assert!(matches!(
+                    service
+                        .generate_batch_prepared(|| Ok(batch_requests(3)))
+                        .await,
+                    Err(InferenceError::Internal(_))
+                ));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(discards.load(Ordering::SeqCst), 1);
+            assert_eq!(service.admission.available_permits(), 1);
+            drop(service);
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_disconnect_cancels_remaining_choices_and_handoff_waits_for_cleanup() {
+        for streaming in [false, true] {
+            let (service, worker, entered, cleanup, release, calls) = slow_cleanup_service().await;
+            let mut stream = None;
+            let mut single = None;
+            if streaming {
+                stream = Some(
+                    service
+                        .stream_batch_prepared(|| Ok(batch_requests(3)))
+                        .await
+                        .unwrap(),
+                );
+            } else {
+                single = Some(tokio::spawn({
+                    let service = service.clone();
+                    async move {
+                        service
+                            .generate_batch_prepared(|| Ok(batch_requests(3)))
+                            .await
+                    }
+                }));
+            }
+            entered.notified().await;
+            drop(stream);
+            if let Some(single) = single {
+                single.abort();
+                let _ = single.await;
+            }
+            cleanup.notified().await;
+            let successor = tokio::spawn({
+                let service = service.clone();
+                async move {
+                    service
+                        .generate_batch_prepared(|| Ok(batch_requests(2)))
+                        .await
+                }
+            });
+            wait_for_handoff(&service).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(service.admission.available_permits(), 0);
+            assert!(matches!(
+                service
+                    .stream_batch_prepared(|| panic!("second batch waiter prepared"))
+                    .await,
+                Err(InferenceError::Busy)
+            ));
+            release.send(()).unwrap();
+            assert_eq!(successor.await.unwrap().unwrap().len(), 2);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            drop(service);
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_stream_has_bounded_backpressure_and_retains_admission_until_native_exit() {
+        let progress = Arc::new(AtomicUsize::new(0));
+        let full = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let discards = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel();
+        let fixture = BackpressureEngine {
+            progress: progress.clone(),
+            full: full.clone(),
+            cancelled: cancelled.clone(),
+            release: gate,
+            discards: discards.clone(),
+        };
+        let (service, worker) = InferenceService::spawn(move || Ok(fixture)).await.unwrap();
+        let stream = service
+            .stream_batch_prepared(|| Ok(batch_requests(3)))
+            .await
+            .unwrap();
+        full.notified().await;
+        assert_eq!(stream.len(), STREAM_CAPACITY);
+        assert_eq!(progress.load(Ordering::SeqCst), STREAM_CAPACITY);
+        drop(stream);
+        cancelled.notified().await;
+        assert_eq!(service.admission.available_permits(), 0);
+        let successor = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .generate_batch_prepared(|| panic!("timed-out batch prepared"))
+                    .await
+            }
+        });
+        wait_for_handoff(&service).await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), successor)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(InferenceError::Busy)
+        ));
+        assert_eq!(service.admission.available_permits(), 0);
+        assert_eq!(service.handoff_waiter.available_permits(), 1);
+        release.send(()).unwrap();
+        drop(service);
+        worker.await.unwrap();
+        assert_eq!(discards.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_abandoned_preparation_retains_permit_and_skips_native_work() {
+        let (service, worker, calls, discards) = counting_service().await;
+        let (entered, ready) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let stream = service
+            .stream_batch_prepared(move || {
+                entered.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(batch_requests(3))
+            })
+            .await
+            .unwrap();
+        ready.await.unwrap();
+        drop(stream);
+        assert_eq!(service.admission.available_permits(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(2), service.admission.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(discards.load(Ordering::SeqCst), 0);
+        drop(service);
+        worker.await.unwrap();
+    }
+
+    struct LateBatchDisconnect {
+        disconnect: Option<Box<dyn FnOnce() + Send>>,
+        calls: usize,
+        discards: usize,
+    }
+
+    impl Engine for LateBatchDisconnect {
+        fn generate(
+            &mut self,
+            _: GenerationRequest,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            self.calls += 1;
+            self.disconnect.take().unwrap()();
+            Ok(Generation {
+                text: "late result".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
+            })
+        }
+        fn discard_request_state(&mut self) {
+            self.discards += 1;
+        }
+    }
+
+    #[test]
+    fn batch_failed_terminal_delivery_discards_once_before_admission_release() {
+        for streaming in [false, true] {
+            let (reply, disconnect): (JobReply, Box<dyn FnOnce() + Send>) = if streaming {
+                let (reply, receive) = mpsc::channel(STREAM_CAPACITY);
+                (
+                    JobReply::BatchStream(reply),
+                    Box::new(move || drop(receive)),
+                )
+            } else {
+                let (reply, receive) = oneshot::channel();
+                (JobReply::Single(reply), Box::new(move || drop(receive)))
+            };
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = admission.clone().try_acquire_owned().unwrap();
+            let mut engine = LateBatchDisconnect {
+                disconnect: Some(disconnect),
+                calls: 0,
+                discards: 0,
+            };
+            run_generation_batch(&mut engine, batch_requests(3), reply, permit);
+            assert_eq!(engine.calls, 1);
+            assert_eq!(engine.discards, 1);
+            assert_eq!(admission.available_permits(), 1);
+        }
+    }
 
     #[test]
     fn controls_unwrap_without_losing_schema_images_or_request_system() {
@@ -2444,6 +4161,8 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 0,
                 finish_reason: "length",
+                logprobs: None,
+                mean_logprob: None,
             };
             for piece in self.pieces.iter().take(request.options.max_tokens as usize) {
                 ensure_active(cancelled)?;
@@ -2657,6 +4376,7 @@ mod tests {
             if let Some(controls) = request.prompt.generation_controls() {
                 controls.validate_vocab(3)?;
             }
+            validated_prompt_tokens(&request.prompt, 3, 8)?;
             Ok(())
         }
 
@@ -2671,12 +4391,45 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
 
         fn discard_request_state(&mut self) {
             self.discards.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn native_token_prompt_validation_precedes_worker_generation_and_discard() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let discards = Arc::new(AtomicUsize::new(0));
+        let engine = VocabValidationFixture {
+            calls: calls.clone(),
+            discards: discards.clone(),
+        };
+        let (service, worker) = InferenceService::spawn(move || Ok(engine)).await.unwrap();
+        for ids in [vec![], vec![-1], vec![3], vec![0; 9]] {
+            let request = GenerationRequest {
+                prompt: wrapped_token_prompt(ids),
+                ..generation_request()
+            };
+            assert!(matches!(
+                service.generate(request.clone()).await,
+                Err(InferenceError::Invalid(_))
+            ));
+            let mut stream = service.stream_prepared(move || Ok(request)).await.unwrap();
+            assert!(matches!(
+                stream.recv().await,
+                Some(GenerationEvent::Finished(Err(InferenceError::Invalid(_))))
+            ));
+            assert!(stream.recv().await.is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(discards.load(Ordering::SeqCst), 0);
+        drop(service);
+        worker.await.unwrap();
     }
 
     #[tokio::test]
@@ -2748,6 +4501,8 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
 
@@ -3843,6 +5598,8 @@ mod tests {
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
     }
@@ -4065,6 +5822,8 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
 
@@ -4203,6 +5962,7 @@ mod tests {
             | Prompt::RequestSystem { prompt, .. }
             | Prompt::Controls { prompt, .. } => fixture_token_count(prompt),
             Prompt::Text(text) => 2 + text.split_whitespace().count(),
+            Prompt::Tokens(tokens) => tokens.len(),
             Prompt::Chat(messages) => {
                 2 + messages
                     .iter()
@@ -4225,6 +5985,8 @@ mod tests {
                 prompt_tokens: fixture_token_count(&request.prompt),
                 completion_tokens: 1,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
 

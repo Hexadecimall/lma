@@ -244,7 +244,8 @@ impl Host {
             app = app
                 .route("/", get(super::web::index))
                 .route("/chat.js", get(super::web::script))
-                .route("/style.css", get(super::web::style));
+                .route("/style.css", get(super::web::style))
+                .merge(super::openai_files::router(&host.base));
         }
         Ok((app.fallback(dispatch).with_state(host.clone()), host))
     }
@@ -1256,6 +1257,8 @@ mod tests {
                 prompt_tokens: 3,
                 completion_tokens: 1,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
     }
@@ -1553,6 +1556,74 @@ mod tests {
         drop(app);
         host.shutdown().await.unwrap();
     }
+    #[tokio::test]
+    async fn files_routes_are_authenticated_profile_gated_and_model_independent() {
+        for api in ["all", "openai", "ollama", "anthropic", "llama", "lma"] {
+            let (app, host) = Host::new(ServeConfig {
+                api: api.into(),
+                api_key: Some("secret".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let enabled = matches!(api, "all" | "openai");
+            for (method, path) in [
+                ("POST", "/v1/files"),
+                ("HEAD", "/v1/files/file-abcdef/content"),
+                ("DELETE", "/v1/files/file-abcdef"),
+            ] {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{api} {path}");
+            }
+            // Invalid multipart is rejected before the store performs any I/O.
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/files")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status(),
+                if enabled {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::NOT_FOUND
+                },
+                "{api}"
+            );
+            assert!(host.loaded.read().await.is_none());
+            assert_eq!(host.epoch.load(Ordering::SeqCst), 0);
+            drop(app);
+            host.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn files_routes_on_public_bind_require_an_administrator_key() {
+        let (app, host) = Host::new(ServeConfig {
+            host: "0.0.0.0".into(),
+            api: "openai".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let req = Request::builder()
+            .uri("/v1/files")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(host.loaded.read().await.is_none());
+        host.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn idle_first_model_selection_remains_lazy_and_retains_a_reusable_snapshot() {
         let (_directory, config) = tokio::task::spawn_blocking(resident_fixture).await.unwrap();

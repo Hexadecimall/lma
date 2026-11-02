@@ -24,6 +24,7 @@ pub(super) fn profile_prompt(prompt: Prompt, definition: Option<&Definition>) ->
                 schema,
             },
             Prompt::Text(text) => Prompt::Text(text),
+            Prompt::Tokens(tokens) => Prompt::Tokens(tokens),
             Prompt::Chat(mut messages) => {
                 let Some(definition) = definition else {
                     return Prompt::Chat(messages);

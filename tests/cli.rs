@@ -2456,6 +2456,11 @@ fn command_help_describes_connection_and_imagegen_limits() {
         "not full",
         "Tools",
         "unsupported",
+        "n             1..128",
+        "top_logprobs",
+        "best_of:1..128",
+        "/v1/files",
+        "storage on Windows/FreeBSD is not yet supported",
     ] {
         assert!(help.contains(expected), "HTTP help missing {expected}");
     }
@@ -2463,6 +2468,8 @@ fn command_help_describes_connection_and_imagegen_limits() {
         "count_tokens returns HTTP 400",
         "exact token counting unsupported",
         "unsupported count_tokens endpoint",
+        "n             1 only",
+        "Token logprobs, n>1",
     ] {
         assert!(!help.contains(obsolete), "obsolete HTTP help: {obsolete}");
     }

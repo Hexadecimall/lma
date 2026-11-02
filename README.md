@@ -413,37 +413,37 @@ See [performance measurement and the explicit, model-reusing benchmark harness](
 
 Choose `all|openai|ollama|llama|lma|anthropic` with root **`lma s MODEL -a PROFILE`** or **`lma nss serve MODEL --api PROFILE`**. Long flags stay NSS-only; there are no new root long aliases. Default `all` enables every family, including the existing Anthropic routes. `/health` and `/v1/models` are shared; `/api/stop` remains shared host control in every profile. Browser chat is available only with `all`/`openai`; other profiles return API information JSON at `/`.
 
-Profiles wrap the **same in-process engine**, not separate servers or faster inference paths. They are supported subsets, **not full llama-server or cloud parity**; no performance claim is made. Existing OpenAI/Ollama contracts are unchanged. See the **[endpoint profiles and native API contract](docs/endpoints.md)** for exact fields, streaming, limits, and base URLs.
+Profiles wrap the **same in-process engine**, not separate servers or faster inference paths. They are supported subsets, **not full llama-server or cloud parity**; no performance claim is made. OpenAI text support includes native multiple choices, best-of selection, token-ID prompts, output logprobs, and request-level batching; it does not add parallel inference slots or an asynchronous cloud Batch service. See the **[endpoint profiles and native API contract](docs/endpoints.md)** and **[OpenAI text contract](docs/openai-api.md)** for exact fields, streaming, limits, and base URLs.
 
 - **llama** base URL: `http://127.0.0.1:8080` (not `/v1`). Strict `/completion` supports raw `prompt`, `n_predict` (positive or `-1`, inherited `num_predict`/default 256), `temperature` (alias `temp`), `top_p`, `seed`, and `stream` (default false; true enables SSE). No slots, FIM, `cache_prompt`, or stop controls; unsupported fields are rejected. `/tokenize` uses `content` with `add_special:false` / `parse_special:false`; `/detokenize` uses `tokens:[i32]`. Both use actual model token IDs/vocabulary.
 - **Native lma** base URL: `http://127.0.0.1:8080/lma/v1`. `/generate` takes raw `prompt`; `/chat` uses the existing OpenAI role/content/images schema, without tools or remote image fetching. Both accept optional `model`, `max_tokens`, `temperature`, `top_p`, `seed`, and `stream` (default false). Omitted `max_tokens` inherits stored `num_predict`/default 256; **explicit `null` means remaining context/no reply cap**; zero/negative values are rejected. Nonstream JSON contains `api_version:1`, `id`, `model`, `text`, `usage:{input_tokens,output_tokens}`, and `finish_reason:eos|token_limit|context_limit`. `stream:true` emits NDJSON `start`/`delta`/`done`/`error`; deltas carry text, `done` carries usage/finish without repeating aggregate text. New routes have 1 MiB bodies except native `/lma/v1/chat` (24 MiB).
 
 Printed client presets require their API family to be enabled: an explicit incompatible profile prints a warning, not a usable preset. llama/native-lma URLs are endpoint hints, not OpenAI/Anthropic client compatibility claims. See [client setup](docs/clients.md).
 
-| Endpoint                             | Purpose                                                                |
-| ------------------------------------ | ---------------------------------------------------------------------- |
-| `GET /`                              | Public browser chat with all/openai; API info JSON otherwise.          |
-| `GET /health`                        | Ready status; public.                                                  |
-| `GET /v1/models`                     | Installed models plus the explicit startup model.                      |
-| `POST /v1/completions`               | String `prompt` → text; native SSE with `stream:true`.                 |
-| `POST /v1/chat/completions`          | Text/image chat, function calls/results, native text SSE.              |
-| `POST /v1/messages`                  | Anthropic-format messages, function calls/results, SSE.                |
-| `POST /v1/messages/count_tokens`     | Served GGUF prompt count, including function definitions/history.      |
-| `POST /v1/embeddings`                | Native embeddings, float/base64 output, exact token usage.             |
-| `POST /v1/responses`                 | Stateless Responses, function calls/results, SSE.                      |
-| `POST /api/chat`                     | Ollama-compatible chat/tools; NDJSON by default (`stream:true`).       |
-| `POST /api/generate`                 | Ollama-compatible prompt/system/images or raw text; NDJSON by default. |
-| `GET /api/tags`, `GET /api/ps`       | Installed catalog / currently resident model.                          |
-| `POST /api/show`                     | Selected installed-model GGUF header information.                      |
-| `GET /api/version`                   | Actual lma version, not an Ollama release number.                      |
-| `POST /api/embed`, `/api/embeddings` | Native normalized vectors; batched or legacy single prompt.            |
-| `GET /props`                         | llama-profile served-model/context properties.                         |
-| `POST /completion`                   | llama-profile raw text completion; optional SSE.                       |
-| `POST /tokenize`, `/detokenize`      | llama-profile actual model token IDs / vocabulary text.                |
-| `GET /lma/v1/status`                 | Native lma API status.                                                 |
-| `POST /lma/v1/generate`              | Native raw text generation; JSON or NDJSON.                            |
-| `POST /lma/v1/chat`                  | Native text/image chat; JSON or NDJSON, no tools.                      |
-| `POST /api/stop`                     | Shared managed-host unload control, in every profile.                  |
+| Endpoint                             | Purpose                                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------ |
+| `GET /`                              | Public browser chat with all/openai; API info JSON otherwise.            |
+| `GET /health`                        | Ready status; public.                                                    |
+| `GET /v1/models`                     | Installed models plus the explicit startup model.                        |
+| `POST /v1/completions`               | Text/token-ID prompts and prompt batches; `n`, `best_of`, logprobs, SSE. |
+| `POST /v1/chat/completions`          | Text/image chat, function calls/results, `n`, logprobs, SSE.             |
+| `POST /v1/messages`                  | Anthropic-format messages, function calls/results, SSE.                  |
+| `POST /v1/messages/count_tokens`     | Served GGUF prompt count, including function definitions/history.        |
+| `POST /v1/embeddings`                | Native embeddings, float/base64 output, exact token usage.               |
+| `POST /v1/responses`                 | Stateless Responses, function calls/results, SSE.                        |
+| `POST /api/chat`                     | Ollama-compatible chat/tools; NDJSON by default (`stream:true`).         |
+| `POST /api/generate`                 | Ollama-compatible prompt/system/images or raw text; NDJSON by default.   |
+| `GET /api/tags`, `GET /api/ps`       | Installed catalog / currently resident model.                            |
+| `POST /api/show`                     | Selected installed-model GGUF header information.                        |
+| `GET /api/version`                   | Actual lma version, not an Ollama release number.                        |
+| `POST /api/embed`, `/api/embeddings` | Native normalized vectors; batched or legacy single prompt.              |
+| `GET /props`                         | llama-profile served-model/context properties.                           |
+| `POST /completion`                   | llama-profile raw text completion; optional SSE.                         |
+| `POST /tokenize`, `/detokenize`      | llama-profile actual model token IDs / vocabulary text.                  |
+| `GET /lma/v1/status`                 | Native lma API status.                                                   |
+| `POST /lma/v1/generate`              | Native raw text generation; JSON or NDJSON.                              |
+| `POST /lma/v1/chat`                  | Native text/image chat; JSON or NDJSON, no tools.                        |
+| `POST /api/stop`                     | Shared managed-host unload control, in every profile.                    |
 
 ```sh
 curl http://127.0.0.1:8080/v1/models
@@ -454,6 +454,8 @@ curl http://127.0.0.1:8080/api/chat \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false,"options":{"num_predict":64}}'
 ```
+
+**Local Files:** the CLI managed host's `all`/`openai` profiles provide multipart upload/list at `/v1/files`, metadata/delete at `/v1/files/{file_id}`, and binary content at `/v1/files/{file_id}/content`, without loading a model. Files stay in `~/.lma/openai/files`; public binds require an administrator API key. The initial secure implementation requires Linux/macOS/Android with atomic no-replace rename support; Windows and FreeBSD Files storage are not implemented. See [Files notes](docs/openai-files-034.md) for quotas, recovery and durability limits. Upload purposes such as `batch` or `fine-tune` do not implement those services, `/v1/batches`, or file-ID generation inputs.
 
 With `-ay KEY` (NSS `--api-key KEY`), add `-H 'Authorization: Bearer YOUR_KEY'` to **all protected API routes**, including `/v1/*`, `/api/*`, llama routes, native `/lma/v1/*`, discovery, and shared `/api/stop`. Only Anthropic Messages/count routes also accept `x-api-key`; `/health` stays public. Route availability follows `-a` (NSS `--api`): `/v1/models` and public `/health` remain shared; Ollama `/api/*` routes require `all` or `ollama` **except shared `/api/stop`**. The CLI HTTP host lists installed models and supports single-resident model selection, keep-alive/unload, public GGUF pull, alias copy/create with stored text definitions, and source-specific deletion, including Ollama and LM Studio. `lma sp` / `lma nss stop` unload from this host. `/api/create` supports the [bounded Modelfile subset](docs/modelfile.md), but HTTP `FROM` accepts installed selectors only, never arbitrary filesystem paths. Push, blob uploads, custom Go templates, adapters and training are not implemented. See [the API contract](docs/ollama-api.md).
 
@@ -467,20 +469,25 @@ Override with root `-ce plain` (NSS `--chat-template plain`), `native` (strict e
 
 Raw Completions and Chat Completions share these options. Sampling/output defaults below apply when no selected Modelfile definition supplies them; explicit request values win:
 
-| Field         | Behavior                                                               |
-| ------------- | ---------------------------------------------------------------------- |
-| `model`       | Optional; CLI HTTP host selects an installed model, otherwise current. |
-| `max_tokens`  | Positive output limit; default 256.                                    |
-| `temperature` | 0–2; default 0.8; zero selects greedy sampling.                        |
-| `top_p`       | Greater than 0 and at most 1; default 0.95.                            |
-| `seed`        | Optional unsigned 32-bit integer.                                      |
-| `stream`      | Default false; true enables native SSE for Chat and raw Completions.   |
+| Field         | Behavior                                                                           |
+| ------------- | ---------------------------------------------------------------------------------- |
+| `model`       | Optional; CLI HTTP host selects an installed model, otherwise current.             |
+| `max_tokens`  | Positive output limit; default 256.                                                |
+| `temperature` | 0–2; default 0.8; zero selects greedy sampling.                                    |
+| `top_p`       | Greater than 0 and at most 1; default 0.95.                                        |
+| `seed`        | Optional unsigned 32-bit integer.                                                  |
+| `stream`      | Default false; SSE when true; diagnostics/tool envelopes buffer choices.           |
+| `n`           | Integer 1–128 returned choices per prompt; default/null 1, aggregate limits apply. |
 
-These endpoints return `choices`, `usage`, and `finish_reason`. Chat also accepts `tools`, `tool_choice`, `parallel_tool_calls`, assistant `tool_calls`, matched `role:tool` results, and `stream_options.include_usage`. `max_completion_tokens` is an alternative to `max_tokens`, not an additional budget. Native `stop`, frequency/presence penalties and `logit_bias` are now supported, not stripped by client shims. Chat `response_format` and Responses `text.format` support bounded native JSON-object/schema constraints. Completions also supports prompt echo, one-element string-array prompts, `n:1`, `best_of:1`, neutral `logprobs:null` and optional streamed usage. Multiple candidates, token log probabilities, generic suffix infill and all OpenAI cloud services are **not** implemented; see the [exact OpenAI contract](docs/openai-api.md). Prompt tokens (including injected tool definitions and chat/image formatting) plus the **requested** output limit must fit the configured context.
+These endpoints return `choices`, `usage`, and `finish_reason`. Chat also accepts `tools`, `tool_choice`, `parallel_tool_calls`, assistant `tool_calls`, matched `role:tool` results, and `stream_options.include_usage`. `max_completion_tokens` is an alternative to `max_tokens`, not an additional budget. Native `stop`, frequency/presence penalties and `logit_bias` are supported, not stripped by client shims. Chat `response_format` and Responses `text.format` support bounded native JSON-object/schema constraints, including multiple Chat choices. Prompt tokens (including injected tool definitions and chat/image formatting) plus the **requested per-candidate** output limit must fit the configured context.
+
+Completions accepts nonempty strings/string arrays and exact native token-ID arrays/arrays of token-ID arrays. It supports prompt echo and `best_of:1..128` (omission/null defaults to `n`; explicit values must be at least `n`). With `best_of>n`, it ranks by native mean sampled-token log probability and returns `n` choices per prompt; that ranking cannot stream. Usage counts each input prompt once and **all sampled completion tokens**, including hidden candidates. Returned indexes are flattened in prompt-major order. Multiple prompts/candidates run sequentially as **one worker job**, not continuous GPU batching or the OpenAI `/v1/batches` API.
+
+Native output logprobs use Completions integer `logprobs:0..5` (zero still requests chosen-token scores) or Chat `logprobs:true` with `top_logprobs:0..20`. Scores are normalized after grammar/penalty/bias processing and before temperature/top-p selection. They describe generated output, not prompt likelihoods: echo with public logprobs and Chat logprobs with constrained tool envelopes are rejected. Stop/UTF-8 alignment can omit diagnostic records; top lists can be shorter than requested. Request bounds include **128 sampled candidates total**, **262144 requested completion tokens**, **1048576 diagnostic slots**, and candidate/batch-path **64 MiB prepared-prompt and estimated output/diagnostic budgets**. Token-ID prompts have a 131072-ID cap per prompt and still require valid vocabulary IDs, context fit, and HTTP body limits. Generic suffix infill, Responses multiple choices/logprobs, and hosted cloud services remain unsupported; see the [exact OpenAI contract](docs/openai-api.md) and [implementation notes](docs/openai-text-034.md).
 
 Messages uses `tool_use` / `tool_result` content blocks; Responses uses `function_call` / `function_call_output` items. Include full conversation history on every request: no server-side response storage or `previous_response_id`. The shared tool bridge constrains output with native JSON-schema grammar, validates calls/arguments against supplied definitions, and rejects truncated or invalid output without issuing a call. Limits include 32 tools, 8 calls/turn, and a bounded schema subset—not arbitrary JSON Schema. Tools are executed by clients only.
 
-Text SSE forwards actual native deltas. Raw Completions and Chat end with a finish chunk and `data: [DONE]`, and send a separate `choices:[]` usage chunk only with `stream_options.include_usage:true`. With tools enabled, lifecycle events start early, but the structured envelope (including any answer text) is buffered until validated; `x-lma-streaming` distinguishes `native` from `validated-tool-buffer`. Provider cache/reasoning/verbosity hints are advisory, not implemented provider services; accepted hints are disclosed through `x-lma-advisory`. See `lma nss help serve advanced` and [client documentation](docs/clients.md).
+Ordinary text SSE forwards actual native deltas. Successful raw Completions and Chat streams share one request ID/timestamp across stable choice indexes, send one finish chunk per choice, then a separate `choices:[]` usage chunk only with `stream_options.include_usage:true`, and exactly one `data: [DONE]`. Errors do not fabricate final usage or success. **Diagnostic-enabled choices buffer text/logprobs until each candidate finishes**; constrained tool envelopes (including answer text) buffer until validated. `x-lma-streaming` reports `native`, `validated-choice-buffer` for buffered batch/diagnostic paths, or `validated-tool-buffer` for retained single-choice non-diagnostic tool paths. Provider cache/reasoning/verbosity hints are advisory, not implemented provider services; accepted hints are disclosed through `x-lma-advisory`. See `lma nss help serve advanced`, [client documentation](docs/clients.md), and the [current OpenAI field/combination contract](docs/openai-api.md).
 
 ### Images and Ollama-compatible generation
 

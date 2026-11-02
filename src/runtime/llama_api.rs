@@ -377,6 +377,8 @@ mod tests {
                 prompt_tokens: 7,
                 completion_tokens: 3,
                 finish_reason: "length",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
         fn tokenize(
@@ -876,6 +878,8 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             }))),
             None,
         ] {
@@ -899,6 +903,8 @@ mod tests {
                 prompt_tokens: 2,
                 completion_tokens: 0,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             },
             "",
         )

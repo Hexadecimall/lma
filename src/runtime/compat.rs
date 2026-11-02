@@ -21,7 +21,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    inference::{Generation, GenerationEvent, GenerationRequest, Options, Prompt},
+    inference::{
+        BatchGenerationEvent, Generation, GenerationEvent, GenerationRequest, InferenceError,
+        Options, Prompt,
+    },
     server::{ApiError, AppState, ChatContent, ChatMessage, validate_model, validate_options},
     tools::{
         self, Call, Family, History, Output, Plan, arguments, bounded_text, cache_hint, fields,
@@ -419,6 +422,348 @@ pub(super) async fn completion_stream(
     ))
 }
 
+pub(super) enum BatchFormat {
+    Chat { plan: Plan, schema: Option<Value> },
+    Legacy { echoes: Vec<String> },
+}
+pub(super) struct TextBatch {
+    pub candidates: super::openai::Candidates,
+    pub work: usize,
+    pub stream: bool,
+    pub include_usage: bool,
+    pub diagnostics: bool,
+    pub format: BatchFormat,
+}
+impl TextBatch {
+    fn chat(&self) -> bool {
+        matches!(self.format, BatchFormat::Chat { .. })
+    }
+    fn buffered(&self) -> bool {
+        self.diagnostics
+            || matches!(&self.format, BatchFormat::Chat { plan, .. } if plan.constrained())
+    }
+    fn echo_bytes(&self) -> usize {
+        match &self.format {
+            BatchFormat::Legacy { echoes } => echoes.iter().fold(0usize, |total, text| {
+                total.saturating_add(text.len().saturating_mul(self.candidates.n))
+            }),
+            _ => 0,
+        }
+    }
+    fn echo(&self, index: usize) -> &str {
+        match &self.format {
+            BatchFormat::Legacy { echoes } => &echoes[index / self.candidates.best_of],
+            _ => "",
+        }
+    }
+    fn choice(
+        &self,
+        frames: &Frames,
+        result: &Generation,
+        sample: usize,
+        index: usize,
+    ) -> Result<Value, ApiError> {
+        match &self.format {
+            BatchFormat::Chat { plan, schema } => {
+                super::openai::validate_output(result, schema.as_ref())?;
+                // The public response ID is shared; tool-call IDs must still be
+                // unique across independently decoded candidate envelopes.
+                let output = plan.decode(result, &format!("{}_choice_{sample}", frames.id))?;
+                let mut choice = frames.complete(result, &output)["choices"][0].clone();
+                choice["index"] = json!(index);
+                choice["logprobs"] = super::openai::chat_logprobs(result, self.diagnostics)?;
+                Ok(choice)
+            }
+            BatchFormat::Legacy { .. } => Ok(
+                json!({"index":index,"text":format!("{}{}",self.echo(sample),result.text),"finish_reason":result.finish_reason,"logprobs":super::openai::legacy_logprobs(result,self.diagnostics)?}),
+            ),
+        }
+    }
+    fn chunk(&self, frames: &Frames, choice: Value) -> Value {
+        let mut value = json!({"id":frames.id,"object":if self.chat(){"chat.completion.chunk"}else{"text_completion"},"created":frames.created,"model":frames.model,"choices":[choice]});
+        if self.include_usage {
+            value["usage"] = Value::Null;
+        }
+        value
+    }
+    fn delta(&self, frames: &Frames, index: usize, text: &str) -> Event {
+        let choice = if self.chat() {
+            json!({"index":index,"delta":{"content":text},"finish_reason":null,"logprobs":null})
+        } else {
+            json!({"index":index,"text":text,"finish_reason":null,"logprobs":null})
+        };
+        Event::default()
+            .json_data(self.chunk(frames, choice))
+            .unwrap()
+    }
+    fn finish(
+        &self,
+        frames: &Frames,
+        result: &Generation,
+        index: usize,
+    ) -> Result<Vec<Event>, ApiError> {
+        let choice = self.choice(frames, result, index, index)?;
+        let mut events = Vec::new();
+        if self.buffered() {
+            if self.chat() {
+                let message = &choice["message"];
+                let mut delta = json!({});
+                if !message["content"].is_null() {
+                    delta["content"] = message["content"].clone();
+                }
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    delta["tool_calls"] = json!(
+                        calls
+                            .iter()
+                            .enumerate()
+                            .map(|(i, call)| {
+                                let mut call = call.clone();
+                                call["index"] = json!(i);
+                                call
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                }
+                events.push(Event::default().json_data(self.chunk(frames,json!({"index":index,"delta":delta,"finish_reason":null,"logprobs":choice["logprobs"]}))).unwrap());
+            } else {
+                events.push(Event::default().json_data(self.chunk(frames,json!({"index":index,"text":choice["text"],"finish_reason":null,"logprobs":choice["logprobs"]}))).unwrap());
+            }
+        }
+        let finish = if self.chat() {
+            json!({"index":index,"delta":{},"finish_reason":choice["finish_reason"],"logprobs":null})
+        } else {
+            json!({"index":index,"text":"","finish_reason":choice["finish_reason"],"logprobs":null})
+        };
+        events.push(
+            Event::default()
+                .json_data(self.chunk(frames, finish))
+                .unwrap(),
+        );
+        Ok(events)
+    }
+}
+
+/// A single admitted native job owns every candidate. Dropping the outgoing
+/// body wakes send.closed(), drops the native receiver, and cancels the batch.
+pub(super) async fn text_batch(
+    state: AppState,
+    batch: TextBatch,
+    prepare: impl FnOnce() -> Result<Vec<GenerationRequest>, InferenceError> + Send + 'static,
+) -> Result<Response, ApiError> {
+    text_batch_with_limit(state, batch, prepare, super::openai::MAX_OUTPUT_BYTES).await
+}
+
+async fn text_batch_with_limit(
+    state: AppState,
+    batch: TextBatch,
+    prepare: impl FnOnce() -> Result<Vec<GenerationRequest>, InferenceError> + Send + 'static,
+    limit: usize,
+) -> Result<Response, ApiError> {
+    let budget = super::generation_controls::OutputBudget::new(limit);
+    budget.charge(batch.echo_bytes())?;
+    let prepare = move || {
+        let mut requests = prepare()?;
+        for request in &mut requests {
+            let prompt = std::mem::replace(&mut request.prompt, Prompt::Text(String::new()));
+            request.prompt = prompt.with_output_budget(budget.clone());
+        }
+        Ok(requests)
+    };
+    let (id, created) = identifier(&state, if batch.chat() { "chatcmpl" } else { "cmpl" });
+    let frames = Frames {
+        family: Family::Chat,
+        id: id.clone(),
+        created,
+        model: state.model_id.clone(),
+        sequence: 0,
+        include_usage: false,
+        parallel: false,
+        metadata: json!({}),
+    };
+    if !batch.stream {
+        let results = if batch.work == 1 {
+            vec![
+                state
+                    .inference
+                    .generate_prepared(move || {
+                        let mut requests = prepare()?;
+                        if requests.len() != 1 {
+                            return Err(InferenceError::Internal(
+                                "invalid single-candidate preparation".into(),
+                            ));
+                        }
+                        Ok(requests.remove(0))
+                    })
+                    .await?,
+            ]
+        } else {
+            state.inference.generate_batch_prepared(prepare).await?
+        };
+        if results.len() != batch.work {
+            return Err(super::openai::native_error(
+                "native batch returned an unexpected candidate count",
+            ));
+        }
+        let mut usage = super::openai::Usage::default();
+        let mut bytes = batch.echo_bytes();
+        for (index, result) in results.iter().enumerate() {
+            usage.add(result, index % batch.candidates.best_of == 0);
+            bytes = bytes.saturating_add(super::openai::output_bytes(result));
+        }
+        if bytes > super::openai::MAX_OUTPUT_BYTES {
+            return Err(super::openai::resource_error(
+                "aggregate native output exceeds 64 MiB",
+            ));
+        }
+        let choices = batch
+            .candidates
+            .select(&results)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, sample)| batch.choice(&frames, &results[sample], sample, index))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(headers(Json(json!({"id":id,"object":if batch.chat(){"chat.completion"}else{"text_completion"},"created":created,"model":state.model_id,"choices":choices,"usage":usage.value()})).into_response(), &id, None));
+    }
+    let mut native = state.inference.stream_batch_prepared(prepare).await?;
+    let (send, receive) = mpsc::channel::<Result<Event, Infallible>>(8);
+    let response_id = id.clone();
+    let mode = if batch.buffered() {
+        "validated-choice-buffer"
+    } else {
+        "native"
+    };
+    tokio::spawn(async move {
+        let mut finished = 0;
+        let mut emitted = String::new();
+        let mut bytes = batch.echo_bytes();
+        let mut usage = super::openai::Usage::default();
+        // All lifecycle chunks use the request ID and stable flattened indexes.
+        for index in 0..batch.work {
+            let event = if batch.chat() {
+                Event::default().json_data(batch.chunk(&frames,json!({"index":index,"delta":{"role":"assistant"},"finish_reason":null,"logprobs":null}))).unwrap()
+            } else {
+                batch.delta(
+                    &frames,
+                    index,
+                    if batch.buffered() {
+                        ""
+                    } else {
+                        batch.echo(index)
+                    },
+                )
+            };
+            if !send_events(&send, vec![event]).await {
+                return;
+            }
+        }
+        loop {
+            let event = tokio::select! { _=send.closed()=>return, event=native.recv()=>event };
+            let outcome: Result<bool, ApiError> = match event {
+                Some(BatchGenerationEvent::Delta { index, text })
+                    if index == finished && index < batch.work =>
+                {
+                    bytes = bytes.saturating_add(text.len());
+                    if bytes > super::openai::MAX_OUTPUT_BYTES {
+                        Err(super::openai::resource_error(
+                            "aggregate native output exceeds 64 MiB",
+                        ))
+                    } else if matches!(&batch.format,BatchFormat::Chat { plan, .. } if plan.constrained())
+                        && emitted.len().saturating_add(text.len()) > tools::MAX_TOOL_OUTPUT
+                    {
+                        Err(super::openai::native_error(
+                            "constrained tool output exceeds 256 KiB; no call was issued",
+                        ))
+                    } else {
+                        emitted.push_str(&text);
+                        if !batch.buffered()
+                            && !send_events(&send, vec![batch.delta(&frames, index, &text)]).await
+                        {
+                            return;
+                        }
+                        Ok(false)
+                    }
+                }
+                Some(BatchGenerationEvent::Finished {
+                    index,
+                    result: Ok(result),
+                }) if index == finished && index < batch.work => {
+                    bytes = bytes.saturating_add(
+                        super::openai::output_bytes(&result).saturating_sub(result.text.len()),
+                    );
+                    if bytes > super::openai::MAX_OUTPUT_BYTES {
+                        Err(super::openai::resource_error(
+                            "aggregate native output and diagnostics exceed 64 MiB",
+                        ))
+                    } else if result.text != emitted {
+                        Err(super::openai::native_error(
+                            "native stream text did not match its final result",
+                        ))
+                    } else {
+                        match batch.finish(&frames, &result, index) {
+                            Ok(events) => {
+                                usage.add(&result, index % batch.candidates.best_of == 0);
+                                if !send_events(&send, events).await {
+                                    return;
+                                }
+                                emitted.clear();
+                                finished += 1;
+                                Ok(finished == batch.work)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+                Some(BatchGenerationEvent::Finished {
+                    result: Err(error), ..
+                }) => Err(error.into()),
+                Some(_) => Err(super::openai::native_error(
+                    "native batch stream delivered an invalid choice index",
+                )),
+                None => Err(super::openai::native_error(
+                    "native batch stream ended without all final results",
+                )),
+            };
+            match outcome {
+                Ok(false) => {}
+                Ok(true) => {
+                    let mut events = Vec::new();
+                    if batch.include_usage {
+                        let mut value = batch.chunk(&frames, Value::Null);
+                        value["choices"] = json!([]);
+                        value["usage"] = usage.value();
+                        events.push(Event::default().json_data(value).unwrap());
+                    }
+                    events.push(Event::default().data("[DONE]"));
+                    let _ = send_events(&send, events).await;
+                    return;
+                }
+                Err(error) => {
+                    // Cancel native work before a stalled client can block error delivery.
+                    drop(native);
+                    let _ = send_events(
+                        &send,
+                        vec![
+                            Event::default()
+                                .event("error")
+                                .json_data(error.stream_value(&id))
+                                .unwrap(),
+                        ],
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    });
+    Ok(headers(
+        Sse::new(ReceiverStream::new(receive))
+            .keep_alive(KeepAlive::default())
+            .into_response(),
+        &response_id,
+        Some(mode),
+    ))
+}
+
 pub(super) async fn chat(
     state: AppState,
     payload: Result<Json<Value>, JsonRejection>,
@@ -457,6 +802,18 @@ async fn generate(state: AppState, parsed: Parsed, family: Family) -> Result<Res
         .any(|message| message.role == "system");
     let output_schema = parsed.output_schema.clone();
     let prepare_schema = output_schema.clone();
+    let candidates = super::openai::Candidates::parse(&parsed.body, true)?;
+    let diagnostics = parsed.controls.logprobs.is_some();
+    let work = if family == Family::Chat {
+        candidates.validate(1, &parsed.options, parsed.controls.logprobs)?
+    } else {
+        1
+    };
+    if family == Family::Chat && diagnostics && plan.constrained() {
+        return Err(invalid(
+            "Chat logprobs cannot be combined with constrained tool envelopes: native envelope tokens are not assistant content tokens",
+        ));
+    }
     let prepare = move || {
         let prompt = super::openai::constrain(prepare_plan.prepare(history)?, prepare_schema)
             .with_controls(parsed.controls);
@@ -469,6 +826,36 @@ async fn generate(state: AppState, parsed: Parsed, family: Family) -> Result<Res
             options: parsed.options,
         })
     };
+    if family == Family::Chat && (work > 1 || diagnostics) {
+        return text_batch(
+            state,
+            TextBatch {
+                candidates,
+                work,
+                stream: parsed.stream,
+                include_usage: parsed.include_usage,
+                diagnostics,
+                format: BatchFormat::Chat {
+                    plan,
+                    schema: output_schema,
+                },
+            },
+            move || {
+                let request = prepare()?;
+                super::openai::validate_prompt_storage(
+                    std::slice::from_ref(&request.prompt),
+                    work,
+                )?;
+                Ok((0..work)
+                    .map(|index| GenerationRequest {
+                        prompt: request.prompt.clone(),
+                        options: super::openai::candidate_options(&request.options, index),
+                    })
+                    .collect())
+            },
+        )
+        .await;
+    }
     let prefix = match family {
         Family::Chat => "chatcmpl",
         Family::Messages => "msg",
@@ -1315,6 +1702,249 @@ fn identifier(state: &AppState, prefix: &str) -> (String, u64) {
     let sequence = state.next_id.fetch_add(1, Ordering::Relaxed);
     (format!("{prefix}-{created}-{sequence}"), created)
 }
+#[cfg(test)]
+mod budget_tests {
+    use super::super::{
+        generation_controls::{GenerationControls, diagnostic_bytes},
+        inference::{Engine, InferenceService, TokenLogprob},
+        openai::Candidates,
+    };
+    use super::*;
+    use http_body_util::BodyExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize},
+    };
+
+    struct BudgetEngine {
+        calls: Arc<AtomicUsize>,
+        discards: Arc<AtomicUsize>,
+    }
+
+    impl Engine for BudgetEngine {
+        fn generate(
+            &mut self,
+            request: GenerationRequest,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let Prompt::Controls { controls, .. } = request.prompt else {
+                panic!("text_batch did not attach its budget");
+            };
+            let budget = controls.output_budget.unwrap();
+            budget.charge(2)?;
+            let logprobs = if controls.logprobs.is_some() {
+                let mut records = Vec::new();
+                for _ in 0..2 {
+                    budget.charge(diagnostic_bytes(1, 1))?;
+                    records.push(TokenLogprob {
+                        token: "x".into(),
+                        bytes: vec![b'x'],
+                        logprob: -1.0,
+                        top_logprobs: vec![],
+                    });
+                }
+                Some(records)
+            } else {
+                None
+            };
+            Ok(Generation {
+                text: "xx".into(),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                finish_reason: "length",
+                logprobs,
+                mean_logprob: Some(-1.0),
+            })
+        }
+
+        fn discard_request_state(&mut self) {
+            self.discards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn state(inference: InferenceService) -> AppState {
+        AppState {
+            inference,
+            model_id: "fixture".into(),
+            context: 1024,
+            metadata: None,
+            definition: None,
+            api_key: None,
+            next_id: Arc::new(AtomicU64::new(1)),
+            api: "all".into(),
+        }
+    }
+
+    fn batch(work: usize, stream: bool, diagnostics: bool) -> TextBatch {
+        TextBatch {
+            candidates: Candidates {
+                n: work,
+                best_of: work,
+            },
+            work,
+            stream,
+            include_usage: true,
+            diagnostics,
+            format: BatchFormat::Legacy {
+                echoes: vec![if diagnostics {
+                    String::new()
+                } else {
+                    "echo".into()
+                }],
+            },
+        }
+    }
+
+    fn requests(work: usize, diagnostics: bool) -> Vec<GenerationRequest> {
+        (0..work)
+            .map(|_| GenerationRequest {
+                prompt: Prompt::Text("fixture".into()).with_controls(GenerationControls {
+                    logprobs: diagnostics.then_some(0),
+                    ..Default::default()
+                }),
+                options: Options {
+                    until_context: false,
+                    max_tokens: 2,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    seed: None,
+                },
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn output_budget_text_batch_reserves_echoes_and_errors_without_false_success() {
+        for stream in [false, true] {
+            for diagnostics in [false, true] {
+                for work in [1, 3] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let discards = Arc::new(AtomicUsize::new(0));
+                    let engine = BudgetEngine {
+                        calls: calls.clone(),
+                        discards: discards.clone(),
+                    };
+                    let (inference, worker) =
+                        InferenceService::spawn(move || Ok(engine)).await.unwrap();
+                    let per_candidate = 2 + if diagnostics {
+                        2 * diagnostic_bytes(1, 1)
+                    } else {
+                        0
+                    };
+                    let echoes = if diagnostics { 0 } else { 4 * work };
+                    let limit = echoes + per_candidate * work.min(2) - 1;
+                    let result = text_batch_with_limit(
+                        state(inference),
+                        batch(work, stream, diagnostics),
+                        move || Ok(requests(work, diagnostics)),
+                        limit,
+                    )
+                    .await;
+                    let response = match result {
+                        Ok(response) => {
+                            assert!(stream);
+                            response
+                        }
+                        Err(error) => {
+                            assert!(!stream);
+                            error.into_response()
+                        }
+                    };
+                    if !stream {
+                        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+                    }
+                    let body = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        response.into_body().collect(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .to_bytes();
+                    let body = std::str::from_utf8(&body).unwrap();
+                    assert!(body.contains("resource_limit_exceeded"), "{body}");
+                    if stream {
+                        assert!(!body.contains("[DONE]"), "{body}");
+                        assert!(
+                            !body.contains("\"choices\":[]"),
+                            "no successful final usage: {body}"
+                        );
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), work.min(2));
+                    assert_eq!(discards.load(Ordering::SeqCst), 1);
+                    tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn output_budget_single_diagnostic_candidate_succeeds_at_exact_limit() {
+        for stream in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let discards = Arc::new(AtomicUsize::new(0));
+            let engine = BudgetEngine {
+                calls: calls.clone(),
+                discards: discards.clone(),
+            };
+            let (inference, worker) = InferenceService::spawn(move || Ok(engine)).await.unwrap();
+            let response = text_batch_with_limit(
+                state(inference),
+                batch(1, stream, true),
+                || Ok(requests(1, true)),
+                2 + 2 * diagnostic_bytes(1, 1),
+            )
+            .await
+            .unwrap();
+            let body = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                response.into_body().collect(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(!body.contains("resource_limit_exceeded"), "{body}");
+            assert!(body.contains("\"text\":\"xx\""), "{body}");
+            assert!(body.contains("\"token_logprobs\":[-1.0,-1.0]"), "{body}");
+            assert_eq!(body.contains("[DONE]"), stream);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(discards.load(Ordering::SeqCst), 0);
+            tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn output_budget_echo_exhaustion_precedes_preparation_and_native_work() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let discards = Arc::new(AtomicUsize::new(0));
+        let engine = BudgetEngine {
+            calls: calls.clone(),
+            discards: discards.clone(),
+        };
+        let (inference, worker) = InferenceService::spawn(move || Ok(engine)).await.unwrap();
+        let result = text_batch_with_limit(
+            state(inference),
+            batch(2, false, false),
+            || panic!("over-budget echoes prepared"),
+            7,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(discards.load(Ordering::SeqCst), 0);
+        worker.await.unwrap();
+    }
+}
+
 fn headers(mut response: Response, id: &str, streaming: Option<&str>) -> Response {
     response
         .headers_mut()

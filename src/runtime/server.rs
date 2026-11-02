@@ -4,7 +4,6 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -20,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::inference::{
-    Generation, GenerationRequest, InferenceError, InferenceService, Message, Options, Prompt,
+    GenerationRequest, InferenceError, InferenceService, Message, Options, Prompt,
 };
 use crate::config::ServeConfig;
 
@@ -379,7 +378,7 @@ fn present_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompletionRequest {
-    prompt: String,
+    prompt: Value,
     model: Option<String>,
     #[serde(default, deserialize_with = "present_option")]
     max_tokens: Option<u32>,
@@ -666,7 +665,9 @@ async fn completions(
         ],
     )?;
     super::openai::single_choice(&body, false)?;
-    let controls = super::openai::controls(&body)?;
+    let candidates = super::openai::Candidates::parse(&body, false)?;
+    let mut controls = super::openai::controls(&body)?;
+    let diagnostics = controls.logprobs.is_some();
     let echo = body
         .get("echo")
         .filter(|v| !v.is_null())
@@ -683,13 +684,19 @@ async fn completions(
     }
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let include_usage = super::openai::stream_usage(&body, stream)?;
-    if let Some(prompts) = body.get("prompt").and_then(Value::as_array) {
-        if prompts.len() != 1 || !prompts[0].is_string() {
-            return Err(ApiError::invalid(
-                "prompt supports a string or one-element string array; batched/token-ID prompts are not implemented",
-            ));
-        }
-        body["prompt"] = prompts[0].clone();
+    if stream && candidates.best_of > candidates.n {
+        return Err(ApiError::invalid(
+            "best_of greater than n cannot be streamed; use stream:false",
+        ));
+    }
+    if echo && diagnostics {
+        return Err(ApiError::invalid(
+            "echo with logprobs requires native prompt token probabilities, which are not available; disable echo or omit logprobs",
+        ));
+    }
+    // Ranking needs real native scores even when diagnostics are not public.
+    if candidates.best_of > candidates.n && controls.logprobs.is_none() {
+        controls.logprobs = Some(0);
     }
     for key in [
         "stop",
@@ -718,23 +725,68 @@ async fn completions(
         seed: request.seed.or(defaults.seed),
     };
     validate_options(&state, request.model.as_deref(), false, &options)?;
-    if request.prompt.is_empty() {
-        return Err(ApiError::invalid("prompt must be a nonempty string"));
+    let prompts = super::openai::prompts(&request.prompt)?;
+    let work = candidates.validate(prompts.len(), &options, controls.logprobs)?;
+    let mut echoes = Vec::with_capacity(prompts.len());
+    for prompt in &prompts {
+        echoes.push(if echo {
+            match prompt {
+                Prompt::Text(text) => text.clone(),
+                // This is a tokenizer utility job, not a separately admitted
+                // generation. All sampled candidates still share one batch job.
+                Prompt::Tokens(tokens) => state.inference.detokenize(tokens.clone()).await?,
+                _ => unreachable!("legacy prompts are text or token IDs"),
+            }
+        } else {
+            String::new()
+        });
     }
-    let echo = echo.then(|| request.prompt.clone());
-    let generation = GenerationRequest {
-        prompt: Prompt::Text(request.prompt).with_controls(controls),
-        options,
-    };
-    if request.stream {
-        super::compat::completion_stream(state, generation, include_usage, echo).await
-    } else {
-        let mut result = state.inference.generate(generation).await?;
-        if let Some(echo) = echo {
-            result.text.insert_str(0, &echo);
+    if echoes.iter().fold(0usize, |total, text| {
+        total.saturating_add(text.len().saturating_mul(candidates.n))
+    }) > super::openai::MAX_OUTPUT_BYTES
+    {
+        return Err(super::openai::resource_error(
+            "aggregate echoed prompts exceed 64 MiB; lower n or prompt size",
+        ));
+    }
+    if work == 1 && request.stream && !diagnostics {
+        return super::compat::completion_stream(
+            state,
+            GenerationRequest {
+                prompt: prompts.into_iter().next().unwrap().with_controls(controls),
+                options,
+            },
+            include_usage,
+            echo.then(|| echoes.remove(0)),
+        )
+        .await;
+    }
+    let prepare = move || {
+        super::openai::validate_prompt_storage(&prompts, candidates.best_of)?;
+        let mut requests = Vec::with_capacity(work);
+        for prompt in prompts {
+            for _ in 0..candidates.best_of {
+                requests.push(GenerationRequest {
+                    prompt: prompt.clone().with_controls(controls.clone()),
+                    options: super::openai::candidate_options(&options, requests.len()),
+                });
+            }
         }
-        Ok(generation_response(state, result, false).into_response())
-    }
+        Ok(requests)
+    };
+    super::compat::text_batch(
+        state,
+        super::compat::TextBatch {
+            candidates,
+            work,
+            stream: request.stream,
+            include_usage,
+            diagnostics,
+            format: super::compat::BatchFormat::Legacy { echoes },
+        },
+        prepare,
+    )
+    .await
 }
 
 async fn chat_completions(
@@ -751,32 +803,6 @@ pub(super) fn prepare_chat_prompt(messages: Vec<ChatMessage>) -> Result<Prompt, 
     let messages =
         prepare_messages(messages).map_err(|error| InferenceError::Invalid(error.message))?;
     Ok(Prompt::Chat(messages))
-}
-
-fn generation_response(state: AppState, result: Generation, chat: bool) -> Json<Value> {
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let sequence = state.next_id.fetch_add(1, Ordering::Relaxed);
-    let prefix = if chat { "chatcmpl" } else { "cmpl" };
-    let choice = if chat {
-        json!({ "index": 0, "message": { "role": "assistant", "content": result.text }, "finish_reason": result.finish_reason })
-    } else {
-        json!({ "index": 0, "text": result.text, "logprobs": null, "finish_reason": result.finish_reason })
-    };
-    Json(json!({
-        "id": format!("{prefix}-{created}-{sequence}"),
-        "object": if chat { "chat.completion" } else { "text_completion" },
-        "created": created,
-        "model": state.model_id,
-        "choices": [choice],
-        "usage": {
-            "prompt_tokens": result.prompt_tokens,
-            "completion_tokens": result.completion_tokens,
-            "total_tokens": result.prompt_tokens + result.completion_tokens
-        }
-    }))
 }
 
 #[derive(Debug)]
@@ -848,6 +874,9 @@ impl From<InferenceError> for ApiError {
     fn from(error: InferenceError) -> Self {
         match error {
             InferenceError::Invalid(message) => Self::invalid(message),
+            InferenceError::ResourceLimit(message) => {
+                Self::new(StatusCode::BAD_REQUEST, "resource_limit_exceeded", message)
+            }
             InferenceError::Internal(message) => {
                 eprintln!("inference failed: {message}");
                 Self::new(
@@ -1008,13 +1037,14 @@ mod tests {
             if let Some(captured) = &self.captured {
                 captured.lock().unwrap().push(request);
             } else {
-                match &request.prompt {
+                match fixture_without_controls(&request.prompt) {
                     Prompt::Constrained { .. }
                     | Prompt::RequestSystem { .. }
                     | Prompt::Controls { .. } => {
                         panic!("use a tool-aware fixture for constrained prompts")
                     }
                     Prompt::Text(text) => assert_eq!(text, "hello"),
+                    Prompt::Tokens(_) => panic!("use a token-aware fixture for token prompts"),
                     Prompt::Chat(messages) => {
                         assert_eq!(messages[0].content, "hello");
                         assert!(messages[0].images.is_empty());
@@ -1026,6 +1056,8 @@ mod tests {
                 prompt_tokens: 2,
                 completion_tokens: 3,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
     }
@@ -1286,7 +1318,9 @@ mod tests {
                 assert_eq!(request.options.top_p, top_p, "{path} case {case}");
                 assert_eq!(request.options.seed, seed, "{path} case {case}");
                 if raw {
-                    assert!(matches!(&request.prompt, Prompt::Text(text) if text == "hello"));
+                    assert!(
+                        matches!(fixture_prompt_content(&request.prompt), Prompt::Text(text) if text == "hello")
+                    );
                 }
             }
         }
@@ -1449,6 +1483,8 @@ mod tests {
                     prompt_tokens: tokens,
                     completion_tokens: 1,
                     finish_reason: "stop",
+                    logprobs: None,
+                    mean_logprob: None,
                 })
             }
         }
@@ -2187,6 +2223,8 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     finish_reason: "stop",
+                    logprobs: None,
+                    mean_logprob: None,
                 })
             }
             fn generate_stream(
@@ -2233,13 +2271,18 @@ mod tests {
             .oneshot(request(
                 "POST",
                 "/v1/completions",
-                json!({"prompt":"first","stream":true}),
+                json!({"prompt":"first","stream":true,"n":3}),
                 None,
             ))
             .await
             .unwrap();
         let mut stream = response.into_body();
-        assert!(next_sse_frame(&mut stream).await.contains("first"));
+        // Batch lifecycle chunks can precede the first native delta.
+        loop {
+            if next_sse_frame(&mut stream).await.contains("first") {
+                break;
+            }
+        }
         drop(stream);
         tokio::time::timeout(std::time::Duration::from_secs(1), cancelled.notified())
             .await
@@ -2268,6 +2311,389 @@ mod tests {
         assert_eq!(response_json(response).await["choices"][0]["text"], "next");
         drop(app);
         worker.await.unwrap();
+    }
+
+    struct DiagnosticEngine {
+        captured: Captured,
+        sampled: usize,
+        missing_score: bool,
+    }
+    impl Engine for DiagnosticEngine {
+        fn detokenize(
+            &self,
+            tokens: Vec<i32>,
+            _: &dyn Fn() -> bool,
+        ) -> Result<String, InferenceError> {
+            tokens
+                .into_iter()
+                .map(|id| {
+                    char::from_u32(id as u32)
+                        .ok_or_else(|| InferenceError::Invalid("invalid fixture token".into()))
+                })
+                .collect()
+        }
+        fn generate(
+            &mut self,
+            request: GenerationRequest,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Generation, InferenceError> {
+            fn inspect(prompt: &Prompt) -> (usize, Option<usize>) {
+                match prompt {
+                    Prompt::Controls { prompt, controls } => (inspect(prompt).0, controls.logprobs),
+                    Prompt::Constrained { prompt, .. } | Prompt::RequestSystem { prompt, .. } => {
+                        inspect(prompt)
+                    }
+                    Prompt::Tokens(tokens) => (tokens.len(), None),
+                    _ => (2, None),
+                }
+            }
+            let (prompt_tokens, diagnostics) = inspect(&request.prompt);
+            let text = char::from(b'a' + (self.sampled % 26) as u8).to_string();
+            let score = [-3.0f64, -1.0, -2.0][self.sampled % 3];
+            self.sampled += 1;
+            self.captured.lock().unwrap().push(request);
+            let logprobs = diagnostics.map(|top| {
+                use super::super::inference::{TokenAlternative, TokenLogprob};
+                // A real two-outcome probability distribution, not placeholder
+                // scores: exp(chosen) + exp(other) is exactly one.
+                let mut alternatives = vec![
+                    TokenAlternative {
+                        token: text.clone(),
+                        bytes: text.as_bytes().to_vec(),
+                        logprob: score,
+                    },
+                    TokenAlternative {
+                        token: "z".into(),
+                        bytes: vec![b'z'],
+                        logprob: (1.0 - score.exp()).ln(),
+                    },
+                ];
+                alternatives.sort_by(|a, b| b.logprob.total_cmp(&a.logprob));
+                alternatives.truncate(top);
+                vec![TokenLogprob {
+                    token: text.clone(),
+                    bytes: text.as_bytes().to_vec(),
+                    logprob: score,
+                    top_logprobs: alternatives,
+                }]
+            });
+            Ok(Generation {
+                text,
+                prompt_tokens,
+                completion_tokens: 1,
+                finish_reason: if self.sampled % 2 == 0 {
+                    "length"
+                } else {
+                    "stop"
+                },
+                logprobs,
+                mean_logprob: (!self.missing_score && diagnostics.is_some()).then_some(score),
+            })
+        }
+    }
+    async fn diagnostic_app(
+        missing_score: bool,
+    ) -> (Router, Captured, tokio::task::JoinHandle<()>) {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = DiagnosticEngine {
+            captured: captured.clone(),
+            sampled: 0,
+            missing_score,
+        };
+        let (inference, worker) = InferenceService::spawn(move || Ok(engine)).await.unwrap();
+        (router(test_state(inference, None)), captured, worker)
+    }
+    #[tokio::test]
+    async fn openai_best_of_batches_rank_per_prompt_and_charge_all_native_samples() {
+        let (app, captured, worker) = diagnostic_app(false).await;
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/completions",
+                json!({"prompt":["first","second"],"n":2,"best_of":3,"seed":42,"logprobs":2}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let choices = body["choices"].as_array().unwrap();
+        assert_eq!(
+            choices
+                .iter()
+                .map(|v| v["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["b", "c", "e", "f"]
+        );
+        assert_eq!(
+            choices
+                .iter()
+                .map(|v| v["index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            body["usage"],
+            json!({"prompt_tokens":4,"completion_tokens":6,"total_tokens":10})
+        );
+        assert_eq!(choices[0]["logprobs"]["token_logprobs"], json!([-1.0]));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(
+                request.options.seed,
+                Some(42u32.wrapping_add((index as u32).wrapping_mul(0x9e37_79b9)))
+            );
+        }
+        drop(requests);
+        drop(app);
+        worker.await.unwrap();
+        let (app, _, worker) = diagnostic_app(true).await;
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/completions",
+                json!({"prompt":"x","best_of":2}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            response_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("mean token log probability")
+        );
+        drop(app);
+        worker.await.unwrap();
+    }
+    #[tokio::test]
+    async fn openai_token_prompts_and_echo_use_the_native_tokenizer() {
+        for (prompt, echo, expected, prompt_tokens) in [
+            (json!([104, 105]), false, vec!["a"], 2),
+            (json!([[104, 105], [120]]), true, vec!["hia", "xb"], 3),
+            (json!(["hello", "world"]), true, vec!["helloa", "worldb"], 4),
+        ] {
+            let (app, captured, worker) = diagnostic_app(false).await;
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/v1/completions",
+                    json!({"prompt":prompt,"echo":echo}),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(
+                body["choices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["text"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(body["usage"]["prompt_tokens"], prompt_tokens);
+            if prompt[0].is_number() || prompt[0].is_array() {
+                let captured = captured.lock().unwrap();
+                let Prompt::Tokens(tokens) = fixture_prompt_content(&captured[0].prompt) else {
+                    panic!("expected exact native token prompt")
+                };
+                assert_eq!(
+                    serde_json::to_value(tokens).unwrap(),
+                    if prompt[0].is_number() {
+                        prompt.clone()
+                    } else {
+                        prompt[0].clone()
+                    }
+                );
+            }
+            drop(app);
+            worker.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn openai_multi_choice_sse_has_one_identity_stable_finishes_and_final_usage() {
+        for chat in [false, true] {
+            for diagnostics in [false, true] {
+                for include_usage in [false, true] {
+                    let (app, _, worker) = diagnostic_app(false).await;
+                    let mut body = if chat {
+                        json!({"messages":[{"role":"user","content":"x"}],"n":3})
+                    } else {
+                        json!({"prompt":["x","y"],"n":2})
+                    };
+                    body["stream"] = json!(true);
+                    body["stream_options"] = json!({"include_usage":include_usage});
+                    if diagnostics {
+                        body["logprobs"] = if chat { json!(true) } else { json!(2) };
+                        if chat {
+                            body["top_logprobs"] = json!(2);
+                        }
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(request(
+                            "POST",
+                            if chat {
+                                "/v1/chat/completions"
+                            } else {
+                                "/v1/completions"
+                            },
+                            body,
+                            None,
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert_eq!(text.matches("data: [DONE]").count(), 1);
+                    let records = sse_records(text);
+                    assert!(
+                        records
+                            .iter()
+                            .all(|(_, value)| value["id"] == records[0].1["id"])
+                    );
+                    let count = if chat { 3 } else { 4 };
+                    for index in 0..count {
+                        let finishes = records
+                            .iter()
+                            .filter(|(_, value)| {
+                                value["choices"][0]["index"] == index
+                                    && value["choices"][0]["finish_reason"].is_string()
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(finishes.len(), 1, "{text}");
+                        assert_eq!(
+                            finishes[0].1["choices"][0]["finish_reason"],
+                            if index % 2 == 0 { "stop" } else { "length" }
+                        );
+                        let content = records
+                            .iter()
+                            .filter(|(_, value)| value["choices"][0]["index"] == index)
+                            .filter_map(|(_, value)| {
+                                value["choices"][0][if chat { "delta" } else { "text" }]
+                                    .as_str()
+                                    .or_else(|| value["choices"][0]["delta"]["content"].as_str())
+                            })
+                            .collect::<String>();
+                        assert_eq!(content, char::from(b'a' + index as u8).to_string());
+                        if diagnostics {
+                            let record = records
+                                .iter()
+                                .find(|(_, value)| {
+                                    value["choices"][0]["index"] == index
+                                        && value["choices"][0]["logprobs"].is_object()
+                                })
+                                .unwrap();
+                            if chat {
+                                assert_eq!(
+                                    record.1["choices"][0]["logprobs"]["content"][0]["bytes"],
+                                    json!([b'a' + index as u8])
+                                );
+                            } else {
+                                assert_eq!(
+                                    record.1["choices"][0]["logprobs"]["text_offset"],
+                                    json!([0])
+                                );
+                            }
+                        }
+                    }
+                    let usage = records
+                        .iter()
+                        .filter(|(_, value)| value["choices"] == json!([]))
+                        .collect::<Vec<_>>();
+                    assert_eq!(usage.len(), usize::from(include_usage));
+                    if include_usage {
+                        assert_eq!(records.last().unwrap().1["choices"], json!([]));
+                        assert_eq!(
+                            usage[0].1["usage"]["prompt_tokens"],
+                            if chat { 2 } else { 4 }
+                        );
+                        assert_eq!(usage[0].1["usage"]["completion_tokens"], count);
+                    }
+                    drop(app);
+                    worker.await.unwrap();
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn openai_candidate_errors_are_preflighted_before_sampling() {
+        let (app, captured, worker) = diagnostic_app(false).await;
+        for body in [
+            json!({"prompt":"x","n":0}),
+            json!({"prompt":"x","n":2,"best_of":1}),
+            json!({"prompt":["x","y"],"n":65}),
+            json!({"prompt":"x","best_of":2,"stream":true}),
+            json!({"prompt":"x","echo":true,"logprobs":0}),
+            json!({"prompt":"x","logprobs":true}),
+            json!({"prompt":[1,-1]}),
+            json!({"prompt":["x",[1]]}),
+            json!({"prompt":"x","best_of":129}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("POST", "/v1/completions", body.clone(), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        for body in [
+            json!({"messages":[{"role":"user","content":"x"}],"n":128,"max_tokens":1024,"logprobs":true,"top_logprobs":20}),
+            json!({"messages":[{"role":"user","content":"x"}],"logprobs":1}),
+            json!({"messages":[{"role":"user","content":"x"}],"logprobs":true,"top_logprobs":21}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("POST", "/v1/chat/completions", body, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(captured.lock().unwrap().is_empty());
+        drop(app);
+        worker.await.unwrap();
+    }
+    #[tokio::test]
+    async fn openai_chat_choices_return_actual_content_diagnostics() {
+        for n in [1, 3] {
+            let (app, captured, worker) = diagnostic_app(false).await;
+            let response=app.clone().oneshot(request("POST","/v1/chat/completions",json!({"messages":[{"role":"user","content":"x"}],"n":n,"logprobs":true,"top_logprobs":20,"seed":7}),None)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(body["choices"].as_array().unwrap().len(), n);
+            assert_eq!(body["usage"]["prompt_tokens"], 2);
+            assert_eq!(body["usage"]["completion_tokens"], n);
+            for (index, choice) in body["choices"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(choice["index"], index);
+                assert_eq!(
+                    choice["logprobs"]["content"][0]["bytes"],
+                    json!([b'a' + index as u8])
+                );
+                assert_eq!(
+                    choice["logprobs"]["content"][0]["logprob"],
+                    [-3.0, -1.0, -2.0][index]
+                );
+                assert_eq!(
+                    choice["logprobs"]["content"][0]["top_logprobs"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+            assert_eq!(captured.lock().unwrap()[0].options.seed, Some(7));
+            drop(app);
+            worker.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2344,6 +2770,8 @@ mod tests {
                     prompt_tokens: 2,
                     completion_tokens: 5,
                     finish_reason: "stop",
+                    logprobs: None,
+                    mean_logprob: None,
                 })
             }
         }
@@ -2396,7 +2824,7 @@ mod tests {
         let mut invalid = vec![
             json!({}),
             json!({"prompt":""}),
-            json!({"prompt":["hello", "world"]}),
+            json!({"prompt":["hello", 1]}),
         ];
         for (field, value) in [
             ("stream", json!("true")),
@@ -2411,8 +2839,8 @@ mod tests {
             ("seed", json!(-1)),
             ("stop", json!("")),
             ("tools", json!([])),
-            ("n", json!(2)),
-            ("logprobs", json!(1)),
+            ("n", json!(129)),
+            ("logprobs", json!(6)),
             ("response_format", json!({"type":"json_object"})),
         ] {
             let mut body = json!({"prompt":"hello"});
@@ -3263,6 +3691,8 @@ mod tests {
                     prompt_tokens: tokenize(&request.prompt),
                     completion_tokens: 1,
                     finish_reason: "stop",
+                    logprobs: None,
+                    mean_logprob: None,
                 })
             }
         }
@@ -3410,6 +3840,8 @@ mod tests {
                     prompt_tokens: 7,
                     completion_tokens: 11,
                     finish_reason: "length",
+                    logprobs: None,
+                    mean_logprob: None,
                 })
             }
         }
@@ -3577,12 +4009,29 @@ mod tests {
         body
     }
 
+    fn fixture_without_controls(prompt: &Prompt) -> &Prompt {
+        match prompt {
+            Prompt::Controls { prompt, .. } => fixture_without_controls(prompt),
+            _ => prompt,
+        }
+    }
+
+    fn fixture_prompt_content(prompt: &Prompt) -> &Prompt {
+        match prompt {
+            Prompt::Constrained { prompt, .. }
+            | Prompt::RequestSystem { prompt, .. }
+            | Prompt::Controls { prompt, .. } => fixture_prompt_content(prompt),
+            _ => prompt,
+        }
+    }
+
     fn fixture_prompt_tokens(prompt: &Prompt) -> usize {
         match prompt {
             Prompt::Constrained { prompt, .. }
             | Prompt::RequestSystem { prompt, .. }
             | Prompt::Controls { prompt, .. } => fixture_prompt_tokens(prompt),
             Prompt::Text(text) => 2 + text.split_whitespace().count(),
+            Prompt::Tokens(tokens) => tokens.len(),
             Prompt::Chat(messages) => {
                 2 + messages
                     .iter()
@@ -3616,7 +4065,7 @@ mod tests {
                             ["const"],
                         "read_file"
                     );
-                    let Prompt::Chat(messages) = &**prompt else {
+                    let Prompt::Chat(messages) = fixture_prompt_content(prompt) else {
                         panic!("expected chat template input")
                     };
                     assert_eq!(messages[0].role, "system");
@@ -3637,7 +4086,143 @@ mod tests {
                 prompt_tokens: tokens,
                 completion_tokens: 7,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_multiple_tool_choices_are_validated_independently_and_have_unique_calls() {
+        for stream in [false, true] {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let engine = FunctionEngine {
+                captured: captured.clone(),
+            };
+            let (inference, worker) = InferenceService::spawn(move || Ok(engine)).await.unwrap();
+            let app = router(test_state(inference, None));
+            let mut body = function_request("/v1/chat/completions");
+            body["n"] = json!(3);
+            body["stream"] = json!(stream);
+            let response = app
+                .clone()
+                .oneshot(request("POST", "/v1/chat/completions", body, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut ids = Vec::new();
+            if stream {
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert_eq!(text.matches("data: [DONE]").count(), 1);
+                let records = sse_records(text);
+                for index in 0..3 {
+                    let calls = records
+                        .iter()
+                        .filter(|(_, value)| value["choices"][0]["index"] == index)
+                        .filter_map(|(_, value)| {
+                            value["choices"][0]["delta"]["tool_calls"].as_array()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(
+                        calls[0][0]["function"]["arguments"],
+                        "{\"path\":\"src/lib.rs\"}"
+                    );
+                    ids.push(calls[0][0]["id"].as_str().unwrap().to_owned());
+                    let finishes = records
+                        .iter()
+                        .filter(|(_, value)| {
+                            value["choices"][0]["index"] == index
+                                && value["choices"][0]["finish_reason"] == "tool_calls"
+                        })
+                        .count();
+                    assert_eq!(finishes, 1);
+                }
+                assert!(
+                    records
+                        .iter()
+                        .all(|(_, value)| value["choices"][0]["delta"]["content"].is_null())
+                );
+            } else {
+                let body = response_json(response).await;
+                assert_eq!(body["choices"].as_array().unwrap().len(), 3);
+                assert_eq!(body["usage"]["completion_tokens"], 21);
+                for choice in body["choices"].as_array().unwrap() {
+                    assert_eq!(choice["finish_reason"], "tool_calls");
+                    ids.push(
+                        choice["message"]["tool_calls"][0]["id"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    );
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), 3);
+            assert_eq!(captured.lock().unwrap().len(), 3);
+            drop(app);
+            worker.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn openai_multiple_structured_json_choices_keep_native_constraints() {
+        struct JsonBatchEngine;
+        impl Engine for JsonBatchEngine {
+            fn generate(
+                &mut self,
+                request: GenerationRequest,
+                _: &dyn Fn() -> bool,
+            ) -> Result<Generation, InferenceError> {
+                let Prompt::Constrained { schema, .. } = request.prompt else {
+                    panic!("missing native JSON constraint")
+                };
+                assert_eq!(schema, json!({"type":"object"}));
+                Ok(Generation {
+                    text: "{\"ok\":true}".into(),
+                    prompt_tokens: 2,
+                    completion_tokens: 4,
+                    finish_reason: "stop",
+                    logprobs: None,
+                    mean_logprob: None,
+                })
+            }
+        }
+        for stream in [false, true] {
+            let (inference, worker) = InferenceService::spawn(|| Ok(JsonBatchEngine))
+                .await
+                .unwrap();
+            let app = router(test_state(inference, None));
+            let response=app.clone().oneshot(request("POST","/v1/chat/completions",json!({"messages":[{"role":"user","content":"json"}],"n":3,"stream":stream,"response_format":{"type":"json_object"}}),None)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let records = sse_records(std::str::from_utf8(&bytes).unwrap());
+                for index in 0..3 {
+                    let text = records
+                        .iter()
+                        .filter(|(_, value)| value["choices"][0]["index"] == index)
+                        .filter_map(|(_, value)| value["choices"][0]["delta"]["content"].as_str())
+                        .collect::<String>();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&text).unwrap(),
+                        json!({"ok":true})
+                    );
+                }
+            } else {
+                let body = response_json(response).await;
+                assert_eq!(body["choices"].as_array().unwrap().len(), 3);
+                assert_eq!(
+                    body["usage"],
+                    json!({"prompt_tokens":2,"completion_tokens":12,"total_tokens":14})
+                );
+                for choice in body["choices"].as_array().unwrap() {
+                    assert_eq!(choice["message"]["content"], "{\"ok\":true}");
+                }
+            }
+            drop(app);
+            worker.await.unwrap();
         }
     }
 
@@ -4049,6 +4634,8 @@ mod tests {
                     prompt_tokens: 2,
                     completion_tokens: 1,
                     finish_reason: "stop",
+                    logprobs: None,
+                    mean_logprob: None,
                 })
             }
         }
@@ -4404,6 +4991,8 @@ mod tests {
                 prompt_tokens: 2,
                 completion_tokens: 3,
                 finish_reason: "stop",
+                logprobs: None,
+                mean_logprob: None,
             })
         }
     }
@@ -4556,6 +5145,8 @@ mod tests {
                     prompt_tokens: 2,
                     completion_tokens: 3,
                     finish_reason: self.finish,
+                    logprobs: None,
+                    mean_logprob: None,
                 })
             }
         }
@@ -4576,6 +5167,7 @@ mod tests {
                     let (inference,worker)=InferenceService::spawn(move || Ok(engine)).await.unwrap();
                     let app=router(test_state(inference,None));
                     let mut body=function_request(path);body["stream"]=json!(stream);
+                    if path == "/v1/chat/completions" { body["n"]=json!(3); }
                     let response=app.clone().oneshot(request("POST",path,body,None)).await.unwrap();
                     assert_eq!(response.status(),if stream{StatusCode::OK}else{StatusCode::BAD_GATEWAY});
                     let text=String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();

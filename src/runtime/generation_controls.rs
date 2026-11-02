@@ -1,3 +1,8 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use serde_json::Value;
 
 use super::inference::InferenceError;
@@ -8,6 +13,51 @@ pub(super) struct GenerationControls {
     pub(super) frequency_penalty: f32,
     pub(super) presence_penalty: f32,
     pub(super) logit_bias: Vec<(i32, f32)>,
+    /// None disables diagnostics; Some(0) scores only selected tokens.
+    pub logprobs: Option<usize>,
+    /// Internal only: all candidates share one cumulative native-output allowance.
+    pub(super) output_budget: Option<OutputBudget>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct OutputBudget {
+    remaining: Arc<AtomicUsize>,
+}
+
+impl OutputBudget {
+    pub(super) fn new(bytes: usize) -> Self {
+        Self {
+            remaining: Arc::new(AtomicUsize::new(bytes)),
+        }
+    }
+
+    pub(super) fn charge(&self, bytes: usize) -> Result<(), InferenceError> {
+        let mut remaining = self.remaining.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = remaining.checked_sub(bytes) else {
+                return Err(InferenceError::ResourceLimit(
+                    "aggregate native output, diagnostics and echoes exceed the shared byte budget; lower max_tokens, n, best_of or logprobs".into(),
+                ));
+            };
+            match self.remaining.compare_exchange_weak(
+                remaining,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(current) => remaining = current,
+            }
+        }
+    }
+}
+
+/// Conservative retained/serialized diagnostic accounting, shared with preflight
+/// response accounting. UTF-8 replacement labels can be longer than raw pieces.
+pub(super) fn diagnostic_bytes(label_bytes: usize, raw_bytes: usize) -> usize {
+    96usize
+        .saturating_add(label_bytes.saturating_mul(6))
+        .saturating_add(raw_bytes.saturating_mul(4))
 }
 
 impl GenerationControls {
@@ -71,6 +121,24 @@ impl GenerationControls {
                 ));
             }
         }
+        let top = match body.get("top_logprobs") {
+            None | Some(Value::Null) => 0,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n <= 20)
+                .ok_or_else(|| invalid("top_logprobs must be an integer between 0 and 20"))?
+                as usize,
+        };
+        controls.logprobs = match body.get("logprobs") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+            Some(Value::Bool(true)) => Some(top),
+            Some(value) => Some(value.as_u64().filter(|n| *n <= 5).ok_or_else(|| {
+                invalid("logprobs must be a boolean or a legacy integer between 0 and 5")
+            })? as usize),
+        };
+        if top > 0 && !matches!(body.get("logprobs"), Some(Value::Bool(true))) {
+            return Err(invalid("top_logprobs requires logprobs: true"));
+        }
         Ok(controls)
     }
 
@@ -85,9 +153,14 @@ impl GenerationControls {
             && self.frequency_penalty == 0.0
             && self.presence_penalty == 0.0
             && self.logit_bias.is_empty()
+            && self.logprobs.is_none()
+            && self.output_budget.is_none()
     }
 
     pub(super) fn validate_vocab(&self, n_vocab: i32) -> Result<(), InferenceError> {
+        if self.logprobs.is_some_and(|n| n > 20) {
+            return Err(invalid("logprobs supports at most 20 alternatives"));
+        }
         if let Some((id, _)) = self
             .logit_bias
             .iter()
@@ -190,24 +263,45 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn output_budget_is_shared_exact_and_overflow_safe() {
+        let budget = OutputBudget::new(7);
+        let other = budget.clone();
+        budget.charge(3).unwrap();
+        other.charge(4).unwrap();
+        budget.charge(0).unwrap();
+        assert!(matches!(
+            other.charge(1),
+            Err(InferenceError::ResourceLimit(_))
+        ));
+        assert_eq!(budget.remaining.load(Ordering::Relaxed), 0);
+        let budget = OutputBudget::new(2);
+        assert!(budget.charge(usize::MAX).is_err());
+        budget.charge(2).unwrap();
+        assert_eq!(diagnostic_bytes(usize::MAX, usize::MAX), usize::MAX);
+        let controls = GenerationControls {
+            output_budget: Some(budget),
+            ..Default::default()
+        };
+        assert!(!controls.is_default());
+        assert!(!controls.has_sampling());
+        assert!(GenerationControls::default().output_budget.is_none());
+    }
+
+    #[test]
     fn openai_defaults_nulls_boundaries_and_valid_controls() {
         for body in [
             json!({}),
-            json!({"stop": null, "frequency_penalty": null, "presence_penalty": null, "logit_bias": null}),
-            json!({"stop": []}),
+            json!({"stop":null,"frequency_penalty":null,"presence_penalty":null,"logit_bias":null}),
+            json!({"stop":[]}),
         ] {
             assert!(GenerationControls::from_openai(&body).unwrap().is_default());
         }
-        let controls = GenerationControls::from_openai(&json!({
-            "stop": ["end", "🦀"], "frequency_penalty": -2, "presence_penalty": 2,
-            "logit_bias": {"0": -100, "2147483647": 100}
-        }))
-        .unwrap();
+        let controls = GenerationControls::from_openai(&json!({"stop":["end","🦀"],"frequency_penalty":-2,"presence_penalty":2,"logit_bias":{"0":-100,"2147483647":100}})).unwrap();
         assert_eq!(controls.stop, ["end", "🦀"]);
         assert_eq!(controls.frequency_penalty, -2.0);
         assert_eq!(controls.presence_penalty, 2.0);
         assert!(controls.has_sampling());
-        assert!(GenerationControls::from_openai(&json!({"stop": "x".repeat(4096)})).is_ok());
+        assert!(GenerationControls::from_openai(&json!({"stop":"x".repeat(4096)})).is_ok());
     }
 
     #[test]
@@ -222,7 +316,7 @@ mod tests {
             json!({}),
             json!("é".repeat(2049)),
         ] {
-            assert!(GenerationControls::from_openai(&json!({"stop": stop})).is_err());
+            assert!(GenerationControls::from_openai(&json!({"stop":stop})).is_err());
         }
         for name in ["frequency_penalty", "presence_penalty"] {
             for value in [
@@ -252,32 +346,78 @@ mod tests {
             let mut bias = serde_json::Map::new();
             bias.insert(key.into(), json!(1));
             assert!(
-                GenerationControls::from_openai(&json!({"logit_bias": bias})).is_err(),
+                GenerationControls::from_openai(&json!({"logit_bias":bias})).is_err(),
                 "{key}"
             );
         }
         for bias in [
             json!([]),
             json!(1),
-            json!({"0": null}),
-            json!({"0": "1"}),
-            json!({"0": 100.001}),
-            json!({"0": -100.001}),
+            json!({"0":null}),
+            json!({"0":"1"}),
+            json!({"0":100.001}),
+            json!({"0":-100.001}),
         ] {
-            assert!(GenerationControls::from_openai(&json!({"logit_bias": bias})).is_err());
+            assert!(GenerationControls::from_openai(&json!({"logit_bias":bias})).is_err());
         }
         let mut bias = serde_json::Map::new();
         for id in 0..1024 {
             bias.insert(id.to_string(), json!(0));
         }
-        assert!(GenerationControls::from_openai(&json!({"logit_bias": bias.clone()})).is_ok());
+        assert!(GenerationControls::from_openai(&json!({"logit_bias":bias.clone()})).is_ok());
         bias.insert("1024".into(), json!(0));
-        assert!(GenerationControls::from_openai(&json!({"logit_bias": bias})).is_err());
+        assert!(GenerationControls::from_openai(&json!({"logit_bias":bias})).is_err());
+    }
+
+    #[test]
+    fn logprobs_chat_legacy_boundaries_and_disabled_defaults() {
+        for body in [
+            json!({}),
+            json!({"logprobs":null}),
+            json!({"logprobs":false}),
+        ] {
+            let controls = GenerationControls::from_openai(&body).unwrap();
+            assert_eq!(controls.logprobs, None);
+            assert!(controls.is_default());
+        }
+        for (body, count) in [
+            (json!({"logprobs":true}), 0),
+            (json!({"logprobs":true,"top_logprobs":0}), 0),
+            (json!({"logprobs":true,"top_logprobs":20}), 20),
+            (json!({"logprobs":0}), 0),
+            (json!({"logprobs":5}), 5),
+        ] {
+            let controls = GenerationControls::from_openai(&body).unwrap();
+            assert_eq!(controls.logprobs, Some(count));
+            assert!(!controls.is_default());
+            assert!(!controls.has_sampling());
+        }
+        for body in [
+            json!({"logprobs":6}),
+            json!({"logprobs":-1}),
+            json!({"logprobs":"true"}),
+            json!({"logprobs":1.5}),
+            json!({"logprobs":true,"top_logprobs":21}),
+            json!({"logprobs":true,"top_logprobs":-1}),
+            json!({"logprobs":true,"top_logprobs":0.5}),
+            json!({"logprobs":true,"top_logprobs":"1"}),
+            json!({"logprobs":false,"top_logprobs":1}),
+        ] {
+            assert!(GenerationControls::from_openai(&body).is_err(), "{body}");
+        }
+        assert!(
+            GenerationControls {
+                logprobs: Some(21),
+                ..Default::default()
+            }
+            .validate_vocab(3)
+            .is_err()
+        );
     }
 
     #[test]
     fn vocab_validation_includes_zero_bias_entries() {
-        let controls = GenerationControls::from_openai(&json!({"logit_bias": {"3": 0}})).unwrap();
+        let controls = GenerationControls::from_openai(&json!({"logit_bias":{"3":0}})).unwrap();
         assert!(controls.validate_vocab(3).is_err());
         assert!(controls.validate_vocab(4).is_ok());
     }

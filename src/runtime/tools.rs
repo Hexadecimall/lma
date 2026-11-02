@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn constrained_output_is_validated_and_plain_text_cannot_spoof_calls() {
         let plan = plan();
-        let mut generation = Generation { text:json!({"text":"","tool_calls":[{"name":"lookup","arguments":{"path":"src/lib.rs"}}]}).to_string(), prompt_tokens:1,completion_tokens:1,finish_reason:"stop" };
+        let mut generation = Generation { text:json!({"text":"","tool_calls":[{"name":"lookup","arguments":{"path":"src/lib.rs"}}]}).to_string(), prompt_tokens:1,completion_tokens:1,finish_reason:"stop",logprobs:None,mean_logprob:None };
         let output = plan.decode(&generation, "test").unwrap();
         assert_eq!(output.calls[0].name, "lookup");
         assert_eq!(output.calls[0].id, "call_test_0");

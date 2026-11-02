@@ -195,7 +195,7 @@ other build environment overrides are the caller's responsibility.
 
 With `--desktop`, Linux also gets
 `$XDG_DATA_HOME/applications/org.lma.app.desktop` (default
-`~/.local/share/applications`). With `--desktop`, macOS uses `install/Info.plist` for the 0.3.3
+`~/.local/share/applications`). With `--desktop`, macOS uses `install/Info.plist` for the 0.3.4
 `org.lma.app` bundle. If available, `codesign` ad-hoc signs and verifies it before
 publication. **This is a local build: not Developer ID signed or notarized.** The
 installer does not disable Gatekeeper or remove quarantine attributes. CLI-only

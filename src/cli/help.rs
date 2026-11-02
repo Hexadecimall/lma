@@ -838,13 +838,22 @@ OPTIONAL COMPLETIONS / CHAT COMPLETIONS FIELDS
   stop          String or up to four strings; native early stop, stripped from output
   frequency_penalty / presence_penalty   -2..2, generated history only
   logit_bias    Map of loaded-model token IDs to -100..100 bias values
-  n             1 only; neutral logprobs:null (Chat also false) accepted
-  stream_options.include_usage   Optional separate SSE usage record
-  Raw completions: echo, best_of:1, prompt:string or one-element string array.
+  n             1..128 choices, subject to aggregate candidate/output limits
+  logprobs      Chat: boolean; raw completions: integer 0..5
+  top_logprobs  Chat alternatives: 0..20, requires logprobs:true
+  stream_options.include_usage   Optional separate final SSE usage record
+  Raw completions: echo, best_of:1..128 (>=n), string/string[]/token[]/token[][].
+  best_of>n ranks native mean log probabilities and cannot stream.
+  Diagnostic SSE buffers each choice; echo with public logprobs is rejected.
   Chat: response_format text/json_object/json_schema; Responses: text.format.
   JSON uses bounded native grammar/schema validation, not an ignored hint.
   One successor can wait 1.5s after disconnect for worker cleanup; no overlap.
-  Token logprobs, n>1, generic suffix infill and cloud services remain unsupported.
+  Batches are sequential, not parallel GPU slots or asynchronous /v1/batches.
+  Local Files: upload/list/metadata/content/delete under /v1/files, all/openai
+  CLI server profiles only. Stored in ~/.lma/openai/files; no model required.
+  Public Files binds require an API key. Files need atomic no-replace rename;
+  storage on Windows/FreeBSD is not yet supported (other APIs are unaffected).
+  Prompt logprobs, generic suffix infill and cloud services remain unsupported.
   Full field/combination limits: docs/openai-api.md.
 
 IMAGES
